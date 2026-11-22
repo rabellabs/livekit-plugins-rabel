@@ -1,0 +1,988 @@
+# Copyright 2026 Rabel Labs
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Parts of this file are adapted from livekit-agents' MultiSpeakerAdapter, Copyright 2023 LiveKit, Inc., licensed under
+# the Apache License 2.0.
+
+"""Bell around any streaming speech-to-text.
+
+`rabel.STT(inner)` passes the inner speech-to-text's events on, sends the turn's words so far to the Rabel API, and when
+Bell answers with a guess of the turn's final words it emits one PREFLIGHT_TRANSCRIPT with the guess. LiveKit starts the
+LLM on it (preemptive generation) and keeps that reply only if the turn's final words match the guess.
+
+The rules, applied to the inner speech-to-text's events while a guess of Bell's is the running early start:
+  1. Every event is passed on at once unless a rule below holds it.
+  2. An interim whose words agree with the guess is held back (LiveKit would otherwise cancel the early reply); one whose
+     words equal the guess is passed. Words agree with the guess when they are a beginning of it, or when only their last
+     word is a beginning of the guess's word in that place (a part-word: "check my acco" agrees with "check my account
+     number", as some speech-to-text services show a word while it is still being said). The turn's final words still
+     decide what LiveKit keeps.
+  3. An interim that differs from the guess only in a last word the speech-to-text is unsure of (under the API's
+     `hold_line`) is held back one update, then dropped if the next event agrees with the guess, passed (cancelling the
+     guess) otherwise. Without `hold_line` (a version 1 API, or a bad value) the line is 0.9.
+  4. Any other interim that disagrees is passed, which cancels the wrong guess.
+  5. An early start (preflight) of the inner speech-to-text whose words equal the guess is held back; one with other
+     words is passed and replaces the guess.
+  6. Nothing is sent past LiveKit's default limits for preemptive generation (`max_retries` 3, `max_speech_duration`
+     10 s): one guess a turn, never as the third early start of a turn, none after 10 seconds of speech, never a guess
+     equal to the words it was made from or to the running early start. Nor is a guess sent once the speech-to-text has
+     made its own early start in the turn (Deepgram Flux's eager end of turn): while that start runs, a guess would
+     cancel it, and if the caller stops on its words LiveKit keeps no early reply (with `turn_detection="stt"` it starts
+     none at the final); after it, the guess would leave the speech-to-text one start, and when its next early start
+     replaces the guess none is left for the one after, on the words the caller ends on. A guess whose words the
+     speech-to-text has shown by the time it arrives (some speech-to-text services show a turn's last words in one
+     burst) is sent as the early start on those words: it is Bell's guess that the turn ends there.
+  7. A final whose text is exactly that of Bell's guess after the words cancelled the guess (rule 3 or 4) is passed
+     twice: first as an early start on its own words, then as the final. LiveKit remembers the text of the last early
+     start until the next final and starts its own early reply at a final only when the final's text differs from it;
+     without this it would have no reply waiting at its commit and would start the reply there.
+  8. While LiveKit's own early reply made on a final is waiting for LiveKit's commit (the caller has gone on speaking),
+     Bell's guess is held, not sent: LiveKit keeps one early reply waiting at a time, and a guess would replace that
+     reply; if LiveKit then commits the earlier words alone, its reply to them starts again from nothing. The wait
+     begins at a final that changes LiveKit's text (or at rule 7's) and ends at LiveKit's commit, seen when LiveKit adds
+     the caller's message to the conversation (forwarded to the speech-to-text; this wrapper says it takes the
+     conversation for that), or when the speech-to-text's own early start replaces the waiting reply. A held guess is
+     taken again only in that second case, and rule 6 then refuses it (the speech-to-text's own early start came
+     first in the turn); at the commit or the turn's end it is not sent,
+     because LiveKit's reply to the earlier words is then the agent's current speech and LiveKit starts no early
+     reply while it plays.
+  9. On a turn where Bell's guess took one of LiveKit's early starts, an early start of the speech-to-text that comes
+     when none is left is held back while an early reply is running: LiveKit would cancel that reply and start none, so
+     the reply already under way (kept at the commit if its words are the final's) is left to run.
+With no live guess every event passes unchanged, but for rule 7's early start. Bell is only a speculator: it never
+changes the inner speech-to-text's own early starts on turns where it has no live guess. While a guess is live, the
+interims held back by rules 2, 3 and 5 do not reach LiveKit, so the user transcript (the live caption) shows the guess
+until the words move past it or the turn's final words arrive.
+
+Fails open: when the API is slow, down, refuses or errors, the events are exactly the inner speech-to-text's and one
+line is logged.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import dataclasses
+import os
+import re
+import time
+import weakref
+from collections.abc import AsyncIterable
+from typing import TYPE_CHECKING, Any, cast
+
+import aiohttp
+
+from livekit import rtc
+from livekit.agents import LanguageCode, __version__ as _livekit_version, stt, utils
+from livekit.agents.tokenize.basic import split_words
+from livekit.agents.types import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    APIConnectOptions,
+    NotGivenOr,
+)
+
+from ._bell import BellConnection
+from ._form import final_form
+from .log import logger
+from .version import __version__
+
+if TYPE_CHECKING:
+    from livekit.agents.voice.events import ConversationItemAddedEvent
+
+DEFAULT_BASE_URL = "https://api.rabellabs.com"
+# LiveKit's preemptive generation defaults (voice/turn.py, PreemptiveGenerationOptions): at most 3 early starts a turn
+# (`max_retries`), none after 10 s of speech (`max_speech_duration`). The hookup assumes these defaults.
+MAX_EARLY_STARTS = 3
+MAX_SPEECH_S = 10.0
+# rule 3: a speech-to-text may change a word it has shown; a last word under this confidence is taken as unsure.
+# A version 2 API sends the line in `ready.hold_line`; this is used only when it does not (a version 1 API).
+DEFAULT_HOLD_LINE = 0.9
+# the version of the Rabel API's conversation this client speaks
+CONTRACT_VERSION = 2
+DEFAULT_AGENT = "default"
+DEFAULT_MIN_CHANCE = 0.7
+MIN_CHANCE_RANGE = (0.67, 0.99)
+# a guess that arrives later than this after the words it was made from is not used (the Rabel API's docs)
+DEFAULT_ANSWER_TIMEOUT = 0.5
+_AGENT_NAME = re.compile(r"[a-z0-9_-]{1,64}")
+# the hello's `user` (the Rabel API's docs): 1 to 128 of A-Z, a-z, 0-9, '.', '_', ':' and '-'
+_USER = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+# the report's head start is a number from 0 to the conversation's limit in ms (the Rabel API's docs)
+_MAX_HEAD_START_MS = 3_600_000
+
+Words = tuple[str, ...]
+# the module's class under a name that SpeechStream.__init__'s `stt` parameter does not hide
+_RecognizeStream = stt.RecognizeStream
+
+
+def words_of(text: str | None) -> Words:
+    """The words LiveKit compares when it keeps or drops an early reply (agent_activity._transcripts_equivalent):
+    split on whitespace and per character for scripts without spaces, punctuation ignored, case-folded."""
+    if not text:
+        return ()
+    return tuple(
+        w.casefold()
+        for w, _, _ in split_words(text, ignore_punctuation=True, split_character=True)
+        if w
+    )
+
+
+def _is_begin(a: Words, b: Words) -> bool:
+    """a is a beginning of b, or equals it."""
+    return len(a) <= len(b) and b[: len(a)] == a
+
+
+def _part_word(a: Words, b: Words) -> bool:
+    """a's words before its last are a beginning of b, and a's last word is a beginning (not all) of b's word in that place."""
+    n = len(a)
+    return (
+        1 <= n <= len(b)
+        and a[:-1] == b[: n - 1]
+        and a[-1] != b[n - 1]
+        and b[n - 1].startswith(a[-1])
+    )
+
+
+def _agrees(a: Words, b: Words) -> bool:
+    """a agrees with the guess b (rule 2): a is a beginning of b, or differs from one only in a part-word at its end."""
+    return _is_begin(a, b) or _part_word(a, b)
+
+
+def _check_agent(agent: str) -> str:
+    if not isinstance(agent, str) or not _AGENT_NAME.fullmatch(agent):
+        raise ValueError(
+            f"rabel.STT: agent must be 1 to 64 lower-case letters, digits, '-' or '_' (got {agent!r})"
+        )
+    return agent
+
+
+def _check_user(user: str | None) -> str | None:
+    """None, or the form the API takes. The error does not repeat the value: it may be a name or an address."""
+    if user is None:
+        return None
+    if not isinstance(user, str) or not _USER.fullmatch(user):
+        raise ValueError(
+            "rabel.STT: user must be 1 to 128 letters, digits, '.', '_', ':' or '-' (an id you choose, never a "
+            "name, a number or an address)"
+        )
+    return user
+
+
+def _check_report(report: bool) -> bool:
+    if not isinstance(report, bool):
+        raise ValueError(f"rabel.STT: report must be True or False (got {report!r})")
+    return report
+
+
+def _check_min_chance(min_chance: float) -> float:
+    """A number, clamped to 0.67 to 0.99 as the API clamps it (with one logged line when it is moved)."""
+    if isinstance(min_chance, bool) or not isinstance(min_chance, (int, float)):
+        raise ValueError(f"rabel.STT: min_chance must be a number (got {min_chance!r})")
+    lo, hi = MIN_CHANCE_RANGE
+    if not lo <= min_chance <= hi:
+        clamped = min(max(float(min_chance), lo), hi)
+        logger.warning(f"Bell: min_chance {min_chance} is outside {lo} to {hi}; {clamped} is used")
+        return clamped
+    return float(min_chance)
+
+
+def _check_learn(learn: bool) -> bool:
+    if not isinstance(learn, bool):
+        raise ValueError(f"rabel.STT: learn must be True or False (got {learn!r})")
+    return learn
+
+
+def _check_answer_timeout(answer_timeout: float) -> float:
+    if (
+        isinstance(answer_timeout, bool)
+        or not isinstance(answer_timeout, (int, float))
+        or not answer_timeout > 0
+    ):
+        raise ValueError(
+            f"rabel.STT: answer_timeout must be over 0 seconds (got {answer_timeout!r})"
+        )
+    return float(answer_timeout)
+
+
+def _tail_only(w: Words, g: Words) -> bool:
+    """w differs from g only in its last word, and is not longer than g."""
+    n = len(w)
+    return 1 <= n <= len(g) and w[:-1] == g[: n - 1] and w[-1] != g[n - 1]
+
+
+class STT(stt.STT):
+    def __init__(
+        self,
+        stt: stt.STT,
+        *,
+        agent: str = DEFAULT_AGENT,
+        min_chance: float = DEFAULT_MIN_CHANCE,
+        answer_timeout: float = DEFAULT_ANSWER_TIMEOUT,
+        learn: bool = True,
+        user: str | None = None,
+        report: bool = True,
+        enabled: bool = True,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        http_session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        """Wrap a streaming speech-to-text with Bell.
+
+        Args:
+            stt: The speech-to-text to wrap. It keeps every job it has: its words, its end of turn, its own early starts.
+            agent: Your agent's name, which Bell learns for: 1 to 64 lower-case letters, digits, '-' or '_'.
+                Defaults to "default". "demo-bank" is a ready-made agent, already trained on a bank's callers, that
+                every account can use; it never learns.
+            min_chance: How sure Bell must be before it guesses, from 0.67 to 0.99. Defaults to 0.7. A value
+                outside is clamped, as the API clamps it, and one line is logged.
+            answer_timeout: Seconds after the words it was made from within which a guess is still used.
+                Defaults to 0.5. A later guess is dropped and one line is logged.
+            learn: False means the calls through this wrapper teach Bell nothing (for a test or a benchmark).
+                Defaults to True.
+            user: An id you choose for the person on the call, sent in the hello: 1 to 128 letters, digits, '.',
+                '_', ':' or '-'. It must never be a name, a number or an address. Bell does not use it yet.
+                Defaults to None (not sent).
+            report: True (the default) tells the Rabel API at each turn's end whether Bell's guess was kept or
+                dropped, with the head start of a kept one, so your agent's status can show them. No words are
+                added. False leaves it out.
+            enabled: False makes the wrapper a plain pass-through.
+            api_key: Your Rabel API key. Defaults to the RABEL_API_KEY environment variable.
+            base_url: The Rabel API's address. Defaults to RABEL_API_URL, else https://api.rabellabs.com.
+            http_session: An aiohttp session to use for the API's WebSocket.
+        """
+        if not stt.capabilities.streaming:
+            raise ValueError(
+                "rabel.STT needs a streaming speech-to-text (wrap a batch one in stt.StreamAdapter first)"
+            )
+        caps = stt.capabilities
+        if not caps.chat_context:
+            # rule 8 sees LiveKit's commit by the caller's message LiveKit adds to the conversation, which LiveKit forwards
+            # only to a speech-to-text that takes the conversation; the items reach the wrapped one only if it takes them
+            caps = dataclasses.replace(caps, chat_context=True)
+        super().__init__(capabilities=caps)
+        self._stt = stt
+        self._agent = _check_agent(agent)
+        self._min_chance = _check_min_chance(min_chance)
+        self._answer_timeout = _check_answer_timeout(answer_timeout)
+        self._learn = _check_learn(learn)
+        self._user = _check_user(user)
+        self._report = _check_report(report)
+        self._enabled = enabled
+        self._api_key = api_key or os.environ.get("RABEL_API_KEY", "")
+        self._base_url = base_url or os.environ.get("RABEL_API_URL", DEFAULT_BASE_URL)
+        self._http_session = http_session
+        self._hold_line = DEFAULT_HOLD_LINE
+        self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
+        if self._enabled and not self._api_key:
+            logger.warning(
+                "Bell: no Rabel API key (set RABEL_API_KEY); the speech-to-text passes through unchanged"
+            )
+            self._enabled = False
+        self._stt.on("metrics_collected", self._on_metrics_collected)
+        # the wrapped speech-to-text's own metrics are re-emitted; this wrapper adds no second measurement
+        self._recognize_metrics_needed = False
+
+    @property
+    def wrapped_stt(self) -> stt.STT:
+        return self._stt
+
+    @property
+    def model(self) -> str:
+        return self._stt.model
+
+    @property
+    def provider(self) -> str:
+        return self._stt.provider
+
+    def update_options(
+        self,
+        *,
+        agent: NotGivenOr[str] = NOT_GIVEN,
+        min_chance: NotGivenOr[float] = NOT_GIVEN,
+        answer_timeout: NotGivenOr[float] = NOT_GIVEN,
+        learn: NotGivenOr[bool] = NOT_GIVEN,
+        user: NotGivenOr[str | None] = NOT_GIVEN,
+        report: NotGivenOr[bool] = NOT_GIVEN,
+        enabled: NotGivenOr[bool] = NOT_GIVEN,
+    ) -> None:
+        """Takes effect from the next speech stream (answer_timeout and report at once). user=None stops sending it."""
+        if utils.is_given(agent):
+            self._agent = _check_agent(agent)
+        if utils.is_given(min_chance):
+            self._min_chance = _check_min_chance(min_chance)
+        if utils.is_given(answer_timeout):
+            self._answer_timeout = _check_answer_timeout(answer_timeout)
+        if utils.is_given(learn):
+            self._learn = _check_learn(learn)
+        if utils.is_given(user):
+            self._user = _check_user(user)
+        if utils.is_given(report):
+            self._report = _check_report(report)
+        if utils.is_given(enabled):
+            self._enabled = bool(enabled) and bool(self._api_key)
+
+    def _hello(self) -> dict[str, Any]:
+        """The first message's fields besides the key (version 2 of the Rabel API's conversation)."""
+        hello: dict[str, Any] = {
+            "v": CONTRACT_VERSION,
+            "agent": self._agent,
+            "host": "livekit",
+            "host_version": _livekit_version,
+            "hookup": __version__,
+            "vendor": _vendor(self._stt),
+            "min_chance": self._min_chance,
+            "learn": self._learn,
+        }
+        if self._user is not None:
+            hello["user"] = self._user
+        return hello
+
+    def _update_session_keyterms(self, keyterms: list[str]) -> None:
+        self._stt._update_session_keyterms(keyterms)
+
+    def _push_conversation_item(self, ev: ConversationItemAddedEvent) -> None:
+        """Passed on to the wrapped speech-to-text when it takes the conversation context. Bell sends none of it; the
+        caller's message tells the hookup LiveKit has committed a turn (rule 8)."""
+        if self._stt.capabilities.chat_context:
+            self._stt._push_conversation_item(ev)
+        if getattr(getattr(ev, "item", None), "role", None) == "user":
+            for s in list(self._streams):
+                s._on_livekit_commit()
+
+    def prewarm(self) -> None:
+        self._stt.prewarm()
+
+    def _on_metrics_collected(self, *args: Any, **kwargs: Any) -> None:
+        self.emit("metrics_collected", *args, **kwargs)
+
+    async def aclose(self) -> None:
+        self._stt.off("metrics_collected", self._on_metrics_collected)
+
+    async def _recognize_impl(
+        self,
+        buffer: utils.AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        return await self._stt.recognize(buffer, language=language, conn_options=conn_options)
+
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SpeechStream:
+        stream = SpeechStream(stt=self, language=language, conn_options=conn_options)
+        self._streams.add(stream)
+        return stream
+
+
+@dataclasses.dataclass
+class _Turn:
+    speech_start: float
+    committed: list[str] = dataclasses.field(
+        default_factory=list
+    )  # finals inside the turn (speech-to-texts that segment)
+    words: Words = ()  # the words so far
+    history: list[Words] = dataclasses.field(
+        default_factory=list
+    )  # the words sent to Bell, in order
+    starts: int = 0  # early starts LiveKit has made this turn
+    running: Words | None = None  # the words of LiveKit's running early start
+    live: Words | None = None  # Bell's guess, while it is the running early start
+    bell_sent: bool = False
+    held: stt.SpeechEvent | None = None  # rule 3's held interim (one update)
+    sent_heard: bool = False
+    last_alt: stt.SpeechData | None = None
+    shown: str = (
+        ""  # the speech-to-text's text of the words after its finals, as it last showed them
+    )
+    # the Bell conversation this turn goes to: the one open when the turn began, else None (a conversation opened
+    # mid-turn starts with the next turn)
+    conversation: int | None = None
+    heard_at: dict[Words, float] = dataclasses.field(
+        default_factory=dict
+    )  # when each words-so-far was sent
+    held_guess: dict[str, Any] | None = (
+        None  # rule 8: a guess held while LiveKit's own early reply waits
+    )
+    # the report (the Rabel API's docs): when Bell's guess was passed on; when the last final arrived and whether Bell's
+    # guess was then the running early start with the final words equal to it and LiveKit's remembered text unchanged by
+    # the final (and the head start then); whether
+    # LiveKit committed the turn while it was
+    sent_at: float | None = None
+    final_at: float | None = None
+    final_kept: bool = False
+    head_start_ms: int | None = None
+    kept_committed: bool = False
+
+
+class SpeechStream(stt.RecognizeStream):
+    def __init__(
+        self, *, stt: STT, language: NotGivenOr[str], conn_options: APIConnectOptions
+    ) -> None:
+        super().__init__(stt=stt, conn_options=conn_options)
+        self._rstt = stt
+        self._language = language
+        self._turn: _Turn | None = None
+        self._bell: BellConnection | None = None
+        self._broken = False
+        self.counts: dict[str, int] = {}
+        # the inner speech-to-text's stream, and the wall-clock time at which LiveKit says the caller's timeline began
+        # (from the start_time_offset it sets on this stream); both None until known
+        self._inner: _RecognizeStream | None = None
+        self._timeline_start: float | None = None
+        # what LiveKit remembers of the early starts it was given (audio_recognition: `_audio_preflight_transcript`, reset at
+        # each final): the text of the last early start passed since the last final, and whether it was Bell's guess and
+        # the words have since cancelled its reply (rule 7)
+        self._lk_pre: str | None = None
+        self._lk_pre_stale = False
+        # whether LiveKit's turn text (audio_recognition: `_audio_transcript`, the finals since its last commit) is not
+        # empty; LiveKit's comparison at the final, which the report follows, depends on it
+        self._lk_has_text = False
+        # rule 8: LiveKit's own early reply made on a final is waiting for LiveKit's commit
+        self._lk_waiting = False
+        # what this stream's guesses did for the host, for the summary logged when it closes (numbers only)
+        self.summary: dict[str, int] = {
+            "turns": 0,
+            "guesses": 0,
+            "kept": 0,
+            "dropped": 0,
+            "head_start_ms": 0,
+        }
+
+    @property
+    def start_time_offset(self) -> float:
+        return cast(float, stt.RecognizeStream.start_time_offset.fget(self))  # type: ignore[attr-defined]
+
+    @start_time_offset.setter
+    def start_time_offset(self, value: float) -> None:
+        # LiveKit sets this on the hookup's stream so the vendor's word times count from the session's start, not from
+        # the stream's first audio. The vendor's own stream is the inner one, so it gets the same timeline: now if it
+        # exists, else when it is made (and again on every retry's new inner stream).
+        stt.RecognizeStream.start_time_offset.fset(self, value)  # type: ignore[attr-defined]
+        self._timeline_start = time.time() - value
+        if self._inner is not None:
+            self._hand_on_offset(self._inner)
+
+    def _hand_on_offset(self, inner: stt.RecognizeStream) -> None:
+        if self._timeline_start is None:
+            return
+        try:
+            inner.start_time_offset = max(0.0, time.time() - self._timeline_start)
+        except Exception as e:  # noqa: BLE001 -- the vendor's times then count from its first audio, as before
+            logger.warning(f"Bell: could not hand the time offset to the speech-to-text ({e!r})")
+
+    def _count(self, key: str) -> None:
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+    async def _metrics_monitor_task(self, event_aiter: AsyncIterable[stt.SpeechEvent]) -> None:
+        # the wrapped stream reports usage for this audio and its metrics are re-emitted; only the retry reset is kept
+        async for ev in event_aiter:
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                self._mark_provider_progress()
+
+    async def _run(self) -> None:
+        async def _forward_input(stream: stt.RecognizeStream) -> None:
+            async for frame in self._input_ch:
+                if isinstance(frame, rtc.AudioFrame):
+                    stream.push_frame(frame)
+                elif isinstance(frame, self._FlushSentinel):
+                    stream.flush()
+            with contextlib.suppress(RuntimeError):
+                stream.end_input()
+
+        async def _forward_output(stream: stt.RecognizeStream) -> None:
+            async for ev in stream:
+                self._on_inner_event(ev)
+
+        stream = self._rstt._stt.stream(language=self._language, conn_options=self._conn_options)
+        stream._on_provider_progress = self._mark_provider_progress
+        self._hand_on_offset(stream)
+        self._inner = stream
+        if self._rstt._enabled:
+            try:
+                hello = self._rstt._hello()
+                self._bell = BellConnection(
+                    url=self._rstt._base_url,
+                    api_key=self._rstt._api_key,
+                    hello=hello,
+                    on_guess=self._on_guess,
+                    http_session=self._rstt._http_session,
+                )
+                self._bell.start()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Bell: could not start ({e!r}); the speech-to-text passes through unchanged"
+                )
+                self._bell = None
+        tasks = [
+            asyncio.create_task(_forward_input(stream), name="rabel.SpeechStream.forward_input"),
+            asyncio.create_task(_forward_output(stream), name="rabel.SpeechStream.forward_output"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await utils.aio.cancel_and_wait(*tasks)
+            if self._bell is not None:
+                self._log_summary()
+                await self._bell.aclose()
+            self._inner = None
+            await stream.aclose()
+
+    # ------------------------------------------------------------------ the inner speech-to-text's events
+
+    def _emit(self, ev: stt.SpeechEvent) -> None:
+        self._event_ch.send_nowait(ev)
+
+    def _on_inner_event(self, ev: stt.SpeechEvent) -> None:
+        if self._bell is None or self._broken:
+            self._emit(ev)
+            return
+        try:
+            out = self._apply(ev)
+        except Exception as e:  # noqa: BLE001 -- a fault of the wrapper's own never touches the inner events
+            logger.warning(
+                f"Bell: the wrapper failed ({e!r}); the speech-to-text passes through unchanged from here"
+            )
+            self._broken = True
+            out = [ev]
+        for out_ev in out:
+            self._emit(out_ev)
+
+    def _apply(self, ev: stt.SpeechEvent) -> list[stt.SpeechEvent]:
+        T = stt.SpeechEventType
+        if ev.type == T.START_OF_SPEECH:
+            self._end_turn()
+            self._turn = self._new_turn(ev.speech_start_time or time.time())
+            return [ev]
+        if ev.type == T.END_OF_SPEECH:
+            self._end_turn()
+            return [ev]
+        if ev.type not in (T.INTERIM_TRANSCRIPT, T.PREFLIGHT_TRANSCRIPT, T.FINAL_TRANSCRIPT):
+            return [ev]
+
+        alt = ev.alternatives[0] if ev.alternatives else None
+        text = alt.text if alt is not None else ""
+        if not text:
+            return [ev]
+        t = self._turn
+        if t is None:
+            t = self._turn = self._new_turn(time.time())
+        t.last_alt = alt
+
+        if ev.type == T.FINAL_TRANSCRIPT:
+            t.committed.append(text)
+            t.words = words_of(" ".join(t.committed))
+            t.shown = ""
+            t.held = None
+            pre = self._lk_pre
+            # LiveKit's own comparison at the final (audio_recognition, 1.8.13): its turn's text with this final against
+            # its remembered early-start text, as strings, both built as f"{turn text} {words}".lstrip() on the same turn
+            # text; when they differ it starts its own early reply on the final, and the reply started on Bell's guess is
+            # replaced. On a turn text that is not empty that is the final against the early start exactly; on an empty
+            # one, both left-stripped.
+            if pre is None:
+                lk_unchanged = False  # LiveKit remembers "", and a final is never empty here
+            elif self._lk_has_text:
+                lk_unchanged = text == pre
+            else:
+                lk_unchanged = text.lstrip() == pre.lstrip()
+            self._lk_has_text = True
+            # the report: Bell's guess is kept when it is the running early start as the final words arrive, they equal
+            # it, and the final leaves LiveKit's remembered text (the guess's) unchanged by LiveKit's own comparison
+            t.final_at = time.monotonic()
+            t.final_kept = t.live is not None and t.words == t.live and lk_unchanged
+            if t.final_kept and t.sent_at is not None:
+                t.head_start_ms = _ms(t.final_at - t.sent_at)
+            out = [ev]
+            if self._lk_pre_stale and pre is not None and text.strip() == pre.strip():
+                # rule 7: LiveKit still remembers the cancelled guess's text, finds this final unchanged and would start
+                # no early reply on it; the final goes first as the early start on its own words, as LiveKit makes it
+                self._count("final_sent_as_early_start")
+                out = [
+                    dataclasses.replace(
+                        ev,
+                        type=T.PREFLIGHT_TRANSCRIPT,
+                        alternatives=[dataclasses.replace(a) for a in ev.alternatives],
+                    ),
+                    ev,
+                ]
+                changed = True
+            else:
+                # LiveKit starts its own early reply on a final that changes its text (audio_recognition: transcript_changed)
+                changed = pre is None or text.strip() != pre.strip()
+            self._lk_pre, self._lk_pre_stale = None, False
+            if changed:
+                self._lk_waiting = True  # rule 8: that reply now waits for LiveKit's commit
+            return out
+
+        w = words_of(" ".join([*t.committed, text]))
+        t.words = w
+        t.shown = text
+        self._send_heard(t, text, ev)
+
+        if ev.type == T.PREFLIGHT_TRANSCRIPT:
+            if t.live is not None and w == t.live:
+                # rule 5: the reply for these words is already running
+                self._count("eager_held_back")
+                t.held = None
+                return []
+            if t.bell_sent and t.running is not None and t.starts >= MAX_EARLY_STARTS:
+                # rule 9: no early start is left (Bell's guess took one); LiveKit would cancel the running reply and start
+                # none, so the reply under way is left to run
+                self._count("eager_held_no_start_left")
+                return []
+            # passed: LiveKit cancels the running early start, then starts on these words if within its limits
+            t.live, t.held = None, None
+            if t.starts < MAX_EARLY_STARTS and time.time() - t.speech_start <= MAX_SPEECH_S:
+                t.starts += 1
+                t.running = w
+            else:
+                t.running = None
+            self._lk_pre, self._lk_pre_stale = text, False
+            if self._lk_waiting:
+                # rule 8: the speech-to-text's own early start has replaced LiveKit's waiting reply (as without Bell);
+                # a held guess is taken now, as if it arrived after it
+                self._lk_waiting = False
+                return [ev, *self._release_held(t)]
+            return [ev]
+
+        # an interim
+        g = t.live
+        if g is None:
+            if t.running is not None and w != t.running:
+                t.running = None  # LiveKit cancels an early start the words have moved past
+            return [ev]
+        unsure = self._unsure_tail(alt, w, g)
+        if t.held is not None:
+            t.held = None
+            if _agrees(w, g):
+                self._count("hold_agreed")
+                return [ev] if w == g else []
+            self._lk_pre_stale = (
+                True  # rule 7: the guess's reply is cancelled below, its text still remembered
+            )
+            self._count("hold_passed")
+            t.live = t.running = None
+            return [ev]
+        if w == g:
+            return [ev]
+        if _is_begin(w, g):
+            self._count("interim_held_back")  # rule 2
+            return []
+        if _part_word(w, g):
+            self._count("part_word_held_back")  # rule 2, a part-word at the end
+            return []
+        if unsure:
+            self._count("tail_held")  # rule 3
+            t.held = ev
+            return []
+        self._lk_pre_stale = (
+            True  # rule 7: the guess's reply is cancelled below, its text still remembered
+        )
+        self._count("guess_cancelled_by_words")  # rule 4
+        t.live = t.running = None
+        return [ev]
+
+    def _unsure_tail(self, alt: stt.SpeechData | None, w: Words, g: Words) -> bool:
+        """Rule 3's test: w differs from the guess g only in its last word, and that word is one the speech-to-text is
+        unsure of (its confidence under the API's `hold_line`)."""
+        if not _tail_only(w, g):
+            return False
+        b = self._bell
+        conf = None
+        if alt is not None and alt.words:
+            c = getattr(alt.words[-1], "confidence", None)
+            conf = c if isinstance(c, (int, float)) else None
+        line = b.hold_line if b is not None else None
+        if line is None:
+            line = self._rstt._hold_line
+        return conf is not None and conf < line
+
+    def _new_turn(self, speech_start: float) -> _Turn:
+        b = self._bell
+        return _Turn(
+            speech_start=speech_start,
+            conversation=b.conversation if b is not None and b.ready else None,
+        )
+
+    def _turn_open(self, t: _Turn) -> bool:
+        """The turn's conversation is still the open one."""
+        b = self._bell
+        return (
+            b is not None
+            and b.ready
+            and t.conversation is not None
+            and t.conversation == b.conversation
+        )
+
+    def _send_heard(self, t: _Turn, text: str, ev: stt.SpeechEvent) -> None:
+        assert self._bell is not None
+        if not self._turn_open(t):
+            t.conversation = None  # its conversation closed: the rest of this turn is not sent
+            return
+        t.history.append(t.words)
+        t.heard_at[t.words] = time.monotonic()
+        t.sent_heard = True
+        # only the words: no word times, confidences, event kind or vendor
+        self._bell.heard(" ".join([*t.committed, text]))
+
+    def _end_turn(self) -> None:
+        t = self._turn
+        self._turn = None
+        if t is not None and t.held_guess is not None:
+            t.held_guess = None
+            self._count(
+                "held_guess_not_sent_turn_over"
+            )  # rule 8: LiveKit's reply waited the whole turn
+        if t is None:
+            return
+        guess, head_start_ms = self._report_of(t)
+        if t.words:
+            self.summary["turns"] += 1
+        if guess != "none":
+            self.summary["guesses"] += 1
+            self.summary[guess] += 1
+        if guess == "kept":
+            self.summary["head_start_ms"] += head_start_ms or 0
+            # in the form and at the level of LiveKit's own "using preemptive generation" line (agent_activity, 1.8.13)
+            logger.debug("Bell's guess kept", extra={"head_start_ms": head_start_ms})
+        if t.sent_heard and self._bell is not None and self._turn_open(t):
+            text = " ".join(t.committed) if t.committed else " ".join(t.words)
+            if self._rstt._report:
+                self._bell.end_of_turn(text, guess=guess, head_start_ms=head_start_ms)
+            else:
+                self._bell.end_of_turn(text)
+
+    def _report_of(self, t: _Turn) -> tuple[str, int | None]:
+        """What happened to Bell's guess in the turn (the Rabel API's docs): "none" when none was passed on, "kept" with
+        its head start when LiveKit uses the reply started on it, "dropped" otherwise."""
+        if not t.bell_sent:
+            return "none", None
+        if t.kept_committed or (t.final_kept and t.live is not None):
+            return "kept", t.head_start_ms
+        return "dropped", None
+
+    def _log_summary(self) -> None:
+        """One line when the stream closes: numbers only, no word of the call."""
+        s = self.summary
+        with contextlib.suppress(Exception):  # a fault here never reaches the host
+            logger.info(
+                f"Bell: {s['turns']} turns, {s['guesses']} guesses, {s['kept']} kept, {s['dropped']} dropped, "
+                f"{s['head_start_ms']} ms head start in all",
+                extra={
+                    "turns": s["turns"],
+                    "guesses": s["guesses"],
+                    "kept": s["kept"],
+                    "dropped": s["dropped"],
+                    "head_start_ms_total": s["head_start_ms"],
+                },
+            )
+
+    # ------------------------------------------------------------------ LiveKit's commit (rule 8)
+
+    def _on_livekit_commit(self) -> None:
+        """LiveKit has added the caller's message to the conversation: it has committed a turn and taken (or dropped) the
+        early reply that waited. A guess held for it is not sent now: LiveKit's reply to that turn is then the agent's
+        current speech, and LiveKit starts no early reply until it is interrupted or done (agent_activity's
+        on_preemptive_generation), while the guess's text would stay remembered (rule 7's case) for the next final."""
+        try:
+            self._lk_waiting = False
+            # LiveKit's turn text restarts at its commit, so the remembered text can no longer equal a final
+            self._lk_pre, self._lk_pre_stale = None, False
+            self._lk_has_text = False
+            t = self._turn
+            if t is not None and t.final_kept and t.live is not None:
+                t.kept_committed = (
+                    True  # the report: LiveKit has taken the reply started on Bell's guess
+                )
+            if t is not None and t.held_guess is not None:
+                t.held_guess = None
+                self._count("held_guess_not_sent_commit")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Bell: LiveKit's commit could not be handled ({e!r})")
+
+    def _release_held(self, t: _Turn) -> list[stt.SpeechEvent]:
+        """Rule 8: the held guess, taken as if it arrived now (every check but its arrival time is made again)."""
+        m, t.held_guess = t.held_guess, None
+        if m is None:
+            return []
+        try:
+            ev = self._take_guess(m, released=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Bell: a held guess could not be handled ({e!r})")
+            return []
+        return [ev] if ev is not None else []
+
+    # ------------------------------------------------------------------ Bell's guesses
+
+    def _on_guess(self, m: dict[str, Any]) -> None:
+        try:
+            ev = self._take_guess(m)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Bell: a guess could not be handled ({e!r})")
+            return
+        if ev is not None:
+            self._emit(ev)
+
+    def _wrong_data(self, key: str, line: str) -> None:
+        self._count(key)
+        if self._bell is not None:
+            self._bell.log_once("wrong_data", f"Bell: {line}; not used")
+
+    def _take_guess(self, m: dict[str, Any], released: bool = False) -> stt.SpeechEvent | None:
+        """A guess from the API as the early start to send, or None. `released`: a guess rule 8 held, taken again (it
+        arrived in time, so its arrival time is not checked again)."""
+        b = self._bell
+        assert b is not None
+        text, heard, chance = m.get("text"), m.get("heard"), m.get("chance")
+        # wrong data (the Rabel API's docs): a guess this client cannot read, one with no chance from a version 2 API
+        # (one that sent min_chance in its ready; a version 1 API sends neither), one under the min_chance in force,
+        # or one made from words this stream never sent
+        if not isinstance(text, str) or not text.strip() or not isinstance(heard, str):
+            self._wrong_data(
+                "guess_unreadable", "the Rabel API sent a guess this client cannot read"
+            )
+            return None
+        if chance is not None and _unit(chance) is None:
+            self._wrong_data(
+                "guess_unreadable", f"the Rabel API sent a guess with chance {chance!r}"
+            )
+            return None
+        min_chance = b.min_chance if b.min_chance is not None else self._rstt._min_chance
+        if chance is None and b.min_chance is not None:
+            self._wrong_data("guess_no_chance", "the Rabel API sent a guess with no chance")
+            return None
+        if chance is not None and chance < min_chance:
+            self._wrong_data(
+                "guess_below_min_chance",
+                f"the Rabel API sent a guess at chance {chance}, under min_chance {min_chance}",
+            )
+            return None
+        t = self._turn
+        if t is None or self._broken or not self._turn_open(t):
+            self._count("guess_no_turn")  # the turn it answers is over
+            return None
+        g = words_of(text)
+        h = words_of(heard)
+        if not g:
+            self._wrong_data("guess_unreadable", "the Rabel API sent a guess with no words")
+            return None
+        # the guess must still agree with every word heard since it was made (a newer guess replaces a stale one)
+        idx = next((i for i in range(len(t.history) - 1, -1, -1) if t.history[i] == h), None)
+        if idx is None:
+            self._wrong_data(
+                "guess_unknown_heard", "the Rabel API sent a guess made from words never sent"
+            )
+            return None
+        late = time.monotonic() - t.heard_at.get(h, time.monotonic())
+        if not released and late > self._rstt._answer_timeout:
+            self._count("guess_slow")
+            b.log_once(
+                "slow",
+                f"Bell: a guess came {late * 1000:.0f} ms after its words, over answer_timeout "
+                f"{self._rstt._answer_timeout * 1000:.0f} ms; not used",
+            )
+            return None
+        if t.bell_sent:
+            self._count("guess_not_first")
+            return None
+        if any(not _agrees(w, g) for w in t.history[idx + 1 :]):
+            self._count("guess_stale")
+            return None
+        if g == h:
+            self._count(
+                "guess_equals_words"
+            )  # a guess must add words to the words it was made from
+            return None
+        if g == t.words:
+            # the speech-to-text has shown the guessed words since the guess was made: Bell's guess is now that the turn
+            # ends on these words, and it is sent as the early start on them. Some speech-to-text services show a turn's
+            # last words in one burst, faster than the answer time.
+            self._count("guess_reached_by_words")
+        if t.running is not None and g == t.running:
+            self._count("guess_same_as_running")
+            return None
+        if t.starts >= MAX_EARLY_STARTS - 1:
+            self._count("guess_third_start")
+            return None
+        if t.starts >= 1:
+            # rule 6: the speech-to-text has made its own early start in this turn (a guess is sent once a turn, so every
+            # start counted before it is the speech-to-text's): a guess now would cancel that start, or leave the
+            # speech-to-text one start for the rest of the turn
+            self._count("guess_after_stt_start")
+            return None
+        if time.time() - t.speech_start > MAX_SPEECH_S:
+            self._count("guess_past_10s")
+            return None
+        committed = words_of(" ".join(t.committed))
+        if not _is_begin(committed, g):
+            self._count("guess_against_final")
+            return None
+        if self._lk_waiting:
+            # rule 8: LiveKit's own early reply made on a final waits for its commit; an early start now would replace it
+            # (LiveKit keeps one waiting at a time), and if LiveKit then commits that final alone, its reply starts again
+            t.held_guess = m
+            self._count("guess_held_while_livekit_waits")
+            return None
+        # the guess in the final's form: the words so far exactly as the speech-to-text showed them, Bell's added words
+        # formed after them (LiveKit's default turn detection keeps an early reply only when the final is the same string)
+        shown_words = words_of(t.shown)
+        if t.words == committed + shown_words and _is_begin(t.words, g):
+            text = final_form(t.shown, g[len(t.words) :])
+        elif committed:
+            text = " ".join(g[len(committed) :])
+        alt = t.last_alt
+        lang = (
+            alt.language
+            if alt is not None
+            else LanguageCode(self._language if utils.is_given(self._language) else "")
+        )
+        sd = stt.SpeechData(
+            language=lang, text=text, confidence=alt.confidence if alt is not None else 0.0
+        )
+        t.bell_sent = True
+        t.sent_at = time.monotonic()
+        t.starts += 1
+        t.running = t.live = g
+        t.held = None
+        self._lk_pre, self._lk_pre_stale = text, False
+        self._count("guess_sent")
+        logger.debug(
+            "Bell: a guess sent as an early start",
+            extra={"chance": chance, "words_so_far": len(t.words)},
+        )
+        return stt.SpeechEvent(type=stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, alternatives=[sd])
+
+
+def _unit(v: Any) -> float | None:
+    """A number from 0 to 1, else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.0 <= v <= 1.0:
+        return None
+    return float(v)
+
+
+def _ms(seconds: float) -> int:
+    """A head start in whole ms, from 0 to the API's limit."""
+    return max(0, min(round(seconds * 1000), _MAX_HEAD_START_MS))
+
+
+def _vendor(s: stt.STT) -> str:
+    """The wrapped speech-to-text as `provider/model` in lower case, for example "deepgram/flux-general-en"."""
+    provider = (s.provider or "unknown").lower()
+    model = s.model
+    return f"{provider}/{model.lower()}" if model and model != "unknown" else provider
