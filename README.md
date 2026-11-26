@@ -16,7 +16,7 @@ ends.
 
 Bell runs on Rabel's servers: there is nothing to host and no GPU. It answers in about 3 ms to an agent in the same cloud
 region (Google Cloud's us-east1) and about 72 ms from the US west coast, read from one Google Cloud machine in each (the
-western one in Oregon) and not yet from LiveKit Cloud or any other network. One key holds up to 50 calls at once. Tested with LiveKit Agents 1.8.13. The numbers here come from
+western one in Oregon) and not yet from LiveKit Cloud or any other network. One key holds up to 50 calls at once. Tested with LiveKit Agents 1.8.13 and 1.9.0. The numbers here come from
 scripted calls to one bank, in English, with Deepgram Flux as the speech-to-text; the rest is under [Limits](#limits).
 
 **What Rabel keeps.** Bell never receives audio. It takes nothing but the words from your speech-to-text and holds a
@@ -24,6 +24,8 @@ call's words only while that call is open. When the call closes, Bell learns fro
 What it learns stays with your agent and is never filed under a call or under a caller's name or number. Some of it is
 your callers' own words, which can be a name or a number. You can list those at any time and delete any of them. The
 rest is in a form that nobody but Rabel can match back to words. Deleting an agent erases what Bell learned for it.
+The first message of each conversation also names this plugin and its version, LiveKit's version and your
+speech-to-text's provider and model. The API does not read those fields.
 Rabel's notice says it in full: [rabellabs.com/api-privacy](https://rabellabs.com/api-privacy).
 
 Rabel Labs is not affiliated with, endorsed by or sponsored by LiveKit, Pipecat (Daily) or Deepgram; they are named only
@@ -48,12 +50,11 @@ the seconds it is open, silence included.
 Wrap the speech-to-text you already use. This is the one changed line:
 
 ```python
-from livekit.agents import AgentSession, TurnHandlingOptions
+from livekit.agents import AgentSession
 from livekit.plugins import deepgram, rabel
 
 session = AgentSession(
-    stt=rabel.STT(deepgram.STTv2(model="flux-general-en", eager_eot_threshold=0.5), agent="front-desk"),
-    turn_handling=TurnHandlingOptions(turn_detection="stt"),
+    stt=rabel.STT(deepgram.STTv2(model="flux-general-en"), agent="front-desk"),
     ...
 )
 ```
@@ -69,13 +70,14 @@ Any streaming speech-to-text with interim results can be wrapped. Bell goes with
 not instead of them: on turns where Bell has no guess, the events are the speech-to-text's, unchanged. Preemptive
 generation is on by default in LiveKit, and Bell needs it on.
 
-`turn_detection="stt"` is not required. Bell also works under LiveKit's own turn detection (its VAD and turn detector,
-the default). There LiveKit keeps an early reply only when the final transcript is the same string as the guess, so
-the plugin writes the guess the way your speech-to-text writes its finals.
+The snippet is the setup Rabel's numbers were measured in: LiveKit's own turn detection ends the turn (its VAD and turn
+detector, the default), preemptive generation is on and Flux's eager end of turn is off. There LiveKit keeps an early
+reply only when the final transcript is the same string as the guess, so the plugin writes the guess the way your
+speech-to-text writes its finals.
 
-Rabel's numbers were measured in a different setup from this snippet: LiveKit's own turn detector ends the turn,
-preemptive generation is on and Flux's eager end of turn is off. That is
-`rabel.STT(deepgram.STTv2(model="flux-general-en"), agent="front-desk")` with `turn_handling` left as it is.
+Bell also works with `turn_detection="stt"`, where your speech-to-text ends the turn. With Flux's eager end of turn on
+(`eager_eot_threshold`), Bell sends no guess once Flux has made its own early start in a turn, and Rabel's numbers were
+not read with it on.
 
 ## How a guess is handled
 
@@ -89,8 +91,9 @@ preemptive generation is on and Flux's eager end of turn is off. That is
   `max_speech_duration`, 10 s by default). It reads them from the session, and from the running agent where the agent
   sets its own. A guess is never the last early start the session allows in a turn, and is never sent after the limit
   of speech.
-- Where LiveKit starts no early reply at all, Bell sends no guess: with preemptive generation off, with
-  `turn_detection="manual"`, or with a realtime model in place of the LLM.
+- Where LiveKit starts no early reply, Bell sends no guess: with preemptive generation off, with
+  `turn_detection="manual"`, with a realtime model in place of the LLM, and while your agent's reply is under way and
+  the caller has not interrupted it.
 - **With Flux's eager end of turn on**, Bell sends no guess once your speech-to-text has made its own early start in the
   turn, because the guess would cancel that start's reply or take a start the speech-to-text needs next. On a turn where
   Bell's guess took one of LiveKit's early starts, the speech-to-text's own early start is held back when none is left
@@ -104,7 +107,8 @@ preemptive generation is on and Flux's eager end of turn is off. That is
   default. With it off, the plugin holds every guess that comes after such a reply begins to wait.
 
 These rules make it rare for a guess to start a reply later than it would have started without Bell. Rare is not never.
-In a replay of 300 scripted calls to one bank (1,607 turns), the reply started later than without Bell on 2 turns.
+In the benchmark's run of 26 November 2026 (376 scripted calls to one bank, 2,193 turns), the reply started later than
+without Bell on 6 turns.
 
 ## Options
 
@@ -151,9 +155,10 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   LiveKit always has one left for the caller's real words. With `max_retries` 2, Bell's guess can only be a turn's
   first early start. With `max_retries` 1, Bell sends none. Outside a LiveKit job (a script that drives the
   speech-to-text by itself) the plugin cannot read the session and assumes LiveKit's defaults.
-- **Keep LiveKit's minimum interruption words at its default 0.** Set above 0 (`min_words` in `turn_handling`'s
-  interruption options, `min_interruption_words` before), LiveKit counts a guess's words as the caller's. A "yeah" while
-  your agent speaks can bring a guess long enough to interrupt or pause it.
+- **While your agent is speaking, Bell sends no guess.** LiveKit starts no early reply until the caller has interrupted
+  the agent, and a guess's words would count as the caller's where LiveKit counts the words needed to interrupt
+  (`min_words` in `turn_handling`'s interruption options). Outside a LiveKit job the plugin cannot see the agent
+  speaking; there, keep `min_words` at its default 0.
 - **Keep `forward_chat_context` on.** Off, Bell sends fewer guesses (above).
 - **While a guess is live, your live caption shows the guess.** The user transcript LiveKit shows and sends to your
   front end carries Bell's guess, not the caller's words so far, until the words move past it or the final arrives. A

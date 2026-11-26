@@ -1449,7 +1449,7 @@ async def test_flux_turn_resumed_then_the_caller_goes_on():
 
 
 async def test_flux_eager_running_then_bells_longer_guess_is_not_a_new_early_start():
-    # Flux's eager on (the README's snippet, turn_detection="stt"): its EagerEndOfTurn comes before Bell's answer and is
+    # Flux's eager on (with turn_detection="stt"): its EagerEndOfTurn comes before Bell's answer and is
     # passed, so LiveKit runs an early reply on its words. Bell's guess then arrives with those words and more. Sent, it
     # would be a new early start: LiveKit cancels the reply already running on Flux's words for one on the guess, and when
     # the caller stops where Flux guessed, the final does not match the guess and the reply starts only at LiveKit's
@@ -2369,7 +2369,11 @@ async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypa
     in_session(
         monkeypatch,
         types.SimpleNamespace(
-            options=session.options, turn_detection=None, llm=not_an_llm, current_agent=None
+            options=session.options,
+            turn_detection=None,
+            llm=not_an_llm,
+            current_agent=None,
+            current_speech=None,
         ),
     )
     assert _host_limits().early_replies is False
@@ -2387,6 +2391,7 @@ async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypa
             turn_detection=session.turn_detection,
             llm=None,
             current_agent=agent,
+            current_speech=None,
         ),
     )
     assert _host_limits() == _HostLimits(early_replies=False, max_starts=1, max_speech_s=10.0)
@@ -2475,3 +2480,29 @@ async def test_a_started_session_is_read_through_its_job():
         finally:
             await session.aclose()
     assert _host_limits() == _HostLimits()
+
+
+@pytest.mark.parametrize("interrupted, sent", [(False, False), (True, True)], ids=["speaking", "interrupted"])
+async def test_no_guess_while_the_agents_reply_is_under_way(interrupted, sent, monkeypatch):
+    # LiveKit starts no early reply while the agent's reply is under way and not interrupted; a guess then would start
+    # nothing, and its words would count as the caller's where LiveKit counts the words that interrupt the agent. Once
+    # the caller has interrupted the reply, a guess is an early start again.
+    import types
+
+    session = session_with()
+    in_session(
+        monkeypatch,
+        types.SimpleNamespace(
+            options=session.options,
+            turn_detection=session.turn_detection,
+            llm=None,
+            current_agent=None,
+            current_speech=types.SimpleNamespace(interrupted=interrupted),
+        ),
+    )
+    out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    if sent:
+        assert counts["guess_sent"] == 1 and "guess_while_agent_speaks" not in counts
+    else:
+        assert out == await plain_run(TURN)
+        assert counts["guess_while_agent_speaks"] == 1 and "guess_sent" not in counts

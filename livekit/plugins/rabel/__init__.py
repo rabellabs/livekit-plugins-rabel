@@ -15,8 +15,8 @@
 """Rabel plugin for LiveKit Agents
 
 Bell guesses the caller's final words before the speech-to-text has them. This plugin wraps
-any streaming speech-to-text and sends one guess a turn as a preflight transcript, on which
-LiveKit starts the LLM early. LiveKit's own end-of-turn check keeps or drops that reply.
+any streaming speech-to-text and sends a guess as a preflight transcript, on which LiveKit
+starts the LLM early. LiveKit's own end-of-turn check keeps or drops that reply.
 """
 
 from .stt import STT, SpeechStream

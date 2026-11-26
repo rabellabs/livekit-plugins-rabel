@@ -42,8 +42,9 @@ The rules, applied to the inner speech-to-text's events while a guess of Bell's 
      with an API that answers a version 1 or 2 `ready`), never as the last early start the session allows in a turn (the
      third by default; with `max_retries` 1 Bell sends none), none after the limit of speech, never a guess equal to the
      running early start. No guess is sent where LiveKit starts no early reply at all: preemptive generation switched
-     off, turns ended by hand (`turn_detection="manual"`), or a realtime model in place of the LLM. There a guess would
-     start nothing and would only replace the caller's words in LiveKit's text. Nor is a guess sent once the
+     off, turns ended by hand (`turn_detection="manual"`), a realtime model in place of the LLM, or while the agent's
+     reply is under way and the caller has not interrupted it. There a guess would start nothing and would only replace
+     the caller's words in LiveKit's text. Nor is a guess sent once the
      speech-to-text has
      made its own early start in the turn (Deepgram Flux's eager end of turn): while that start runs, a guess would
      cancel it, and if the caller stops on its words LiveKit keeps no early reply (with `turn_detection="stt"` it starts
@@ -272,6 +273,9 @@ class _HostLimits:
     early_replies: bool = True
     max_starts: int = MAX_EARLY_STARTS  # `max_retries`: early starts LiveKit makes in one turn
     max_speech_s: float = MAX_SPEECH_S  # `max_speech_duration`: none after this much speech
+    # the agent has a reply under way that the caller has not interrupted: LiveKit starts no early reply until it is
+    # interrupted or done (agent_activity's on_preemptive_generation)
+    agent_speaking: bool = False
 
 
 _DEFAULT_LIMITS = _HostLimits()
@@ -327,6 +331,9 @@ def _host_limits() -> _HostLimits:
             ),
             max_starts=max_starts,
             max_speech_s=float(max_speech_s),
+            agent_speaking=(
+                (speech := session.current_speech) is not None and not speech.interrupted
+            ),
         )
     except Exception as e:  # noqa: BLE001 -- a setting that cannot be read never touches the speech-to-text's events
         logger.debug(
@@ -779,6 +786,7 @@ class SpeechStream(stt.RecognizeStream):
             t.waiting_guess = None
             if (
                 lim.early_replies
+                and not lim.agent_speaking
                 and t.starts < lim.max_starts
                 and time.time() - t.speech_start <= lim.max_speech_s
             ):
@@ -1062,6 +1070,12 @@ class SpeechStream(stt.RecognizeStream):
             # a realtime model in place of the LLM). A guess would start nothing; it would only stand in LiveKit's text
             # in place of the caller's words, and a turn ended by hand would commit it as what the caller said.
             self._count("guess_no_early_reply")
+            return None
+        if lim.agent_speaking:
+            # rule 6: the agent's reply is under way and the caller has not interrupted it. LiveKit starts no early
+            # reply now, so the guess would start nothing, and its words would count as the caller's in LiveKit's check
+            # of how many words interrupt the agent (`min_words`)
+            self._count("guess_while_agent_speaks")
             return None
         g = words_of(text)
         h = words_of(heard)
