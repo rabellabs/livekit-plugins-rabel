@@ -1,5 +1,5 @@
 """Tests for livekit-plugins-rabel: the wrapper's rules on a scripted speech-to-text against a local stand-in of the
-Rabel API (versions 1 and 2 of its conversation), and that it fails open (API down, slow, refusing, erroring: the events are
+Rabel API (versions 1, 2 and 3 of its conversation), and that it fails open (API down, slow, refusing, erroring: the events are
 exactly the inner STT's). No test calls a live service."""
 
 from __future__ import annotations
@@ -97,11 +97,16 @@ def user_item(text):
 
 class FakeAPI:
     """v: 1 answers as the API served before version 2 (a bare `ready`, guesses without `chance`); 2 answers as the
-    API's version 2 (`ready` with `min_chance` and `hold_line`, guesses with `chance`).
+    API's version 2 (`ready` with `min_chance` and `hold_line`, guesses with `chance`): today's production, which reads
+    the hookup's version 3 hello as a version 2 hello; 3 answers as an API that serves the new Bell (`ready` with `"v": 3`
+    and `min_chance` as the hello set it, null when it set none, guesses with `chance`). The version 3 stand-in sends
+    `hold_always` and `hold_updates` only through `ready_extra`, so each rule is tested alone; one test gives it the
+    API's own values.
     mode: "ok" (guess `answers[heard words]` after `delay` s), "refuse" (an error message at once), "garbage" (answers
     with broken JSON, a guess for words never sent and a bad_message). `plan` gives a mode for each conversation in
     turn, the last repeating. `ready_after` delays the ready; `close_after` closes a conversation cleanly that long
-    after its ready. `ready_extra` adds fields to a version 2 `ready` (fields this client does not take).
+    after its ready. `ready_extra` adds fields to a version 2 or 3 `ready` (a version 2 `ready` with rule 3's
+    `hold_always` and `hold_updates`: fields this client takes from a version 3 `ready` only).
     `refuse_report` answers an `end_of_turn` that carries the report with 400 bad_message and closes."""
 
     def __init__(
@@ -140,6 +145,20 @@ class FakeAPI:
         if self.v == 1:
             return {"type": "ready"}
         h = self.hello or {}
+        if self.v == 3:
+            min_chance = self.min_chance if self.min_chance is not None else h.get("min_chance")
+            if min_chance is not None:
+                min_chance = min(max(min_chance, 0.67), 0.99)
+            return {
+                "type": "ready",
+                "v": 3,
+                "agent": h.get("agent", "default"),
+                "min_chance": min_chance,
+                "hold_line": self.hold_line,
+                "learning": h.get("learn", True),
+                "calls_heard": 12,
+                **self.ready_extra,
+            }
         min_chance = self.min_chance
         if min_chance is None:  # the API clamps the hello's min_chance and says which is in force
             min_chance = min(max(h.get("min_chance", 0.7), 0.67), 0.99)
@@ -156,7 +175,7 @@ class FakeAPI:
 
     def guess(self, text: str, heard: str) -> dict:
         g = {"type": "guess", "turn": 0, "id": 1, "text": text, "heard": heard}
-        if self.v == 2 and self.send_chance:
+        if self.v in (2, 3) and self.send_chance:
             g["chance"] = self.chance
         return g
 
@@ -289,18 +308,22 @@ async def plain_run(script):
     return await collect(ScriptedSTT(script))
 
 
-def hello_v2(agent="default", min_chance=0.7, learn=True):
-    return {
+def hello_v3(agent="default", min_chance=None, learn=True):
+    """the hello the hookup sends: `"type": "hello"` and `"v": 3`; `min_chance` only when the developer set one"""
+    h = {
         "key": "test",
-        "v": 2,
+        "type": "hello",
+        "v": 3,
         "agent": agent,
         "host": "livekit",
         "host_version": agents_version,
         "hookup": rabel.__version__,
         "vendor": "scripted/script-1",
-        "min_chance": min_chance,
         "learn": learn,
     }
+    if min_chance is not None:
+        h["min_chance"] = min_chance
+    return h
 
 
 # ------------------------------------------------------------------ the hello and the options
@@ -319,8 +342,10 @@ async def test_words_match_livekit_comparison():
         assert (words_of(a) == words_of(b) and bool(words_of(a))) == _transcripts_equivalent(a, b)
 
 
-async def test_hello_carries_version_2_fields():
-    api = FakeAPI(v=2)
+@pytest.mark.parametrize("v", [2, 3], ids=["api-v2", "api-v3"])
+async def test_hello_announces_version_3_and_sends_min_chance_only_when_set(v):
+    # the same hello to today's production (version 2) and to an API that serves the new Bell
+    api = FakeAPI(v=v)
     runner, url = await serve(api)
     try:
         async with aiohttp.ClientSession() as http:
@@ -332,11 +357,11 @@ async def test_hello_carries_version_2_fields():
                 agent="front-desk",
             )
             await collect(w, wait_ready=w)
-            assert api.hello == hello_v2(agent="front-desk")
+            assert api.hello == hello_v3(agent="front-desk")
             # update_options takes effect from the next speech stream
             w.update_options(agent="demo-bank", min_chance=0.9, learn=False)
             await collect(w, wait_ready=w)
-            assert api.hello == hello_v2(agent="demo-bank", min_chance=0.9, learn=False)
+            assert api.hello == hello_v3(agent="demo-bank", min_chance=0.9, learn=False)
             assert (
                 rabel.STT(ScriptedSTT(TURN), api_key="test", learn=False)._hello()["learn"] is False
             )
@@ -367,6 +392,15 @@ async def test_options_are_checked(kw):
     with pytest.raises(ValueError):
         w.update_options(**kw)
     assert w._agent == "demo-bank" and w._min_chance == 0.99
+
+
+async def test_min_chance_left_out_is_not_sent_and_none_goes_back_to_it():
+    w = rabel.STT(ScriptedSTT(TURN), api_key="test")
+    assert w._min_chance is None and "min_chance" not in w._hello()
+    w.update_options(min_chance=0.8)
+    assert w._hello()["min_chance"] == 0.8
+    w.update_options(min_chance=None)
+    assert w._min_chance is None and "min_chance" not in w._hello()
 
 
 @pytest.mark.parametrize("given, used", [(0.5, 0.67), (1.0, 0.99), (0.67, 0.67), (0.8, 0.8)])
@@ -400,7 +434,7 @@ async def test_guess_sent_once_beginnings_held_eager_equal_held(v):
         and counts["interim_held_back"] == 1
         and counts["eager_held_back"] == 1
     )
-    assert api.hello == hello_v2()
+    assert api.hello == hello_v3()
     heard = [m for m in api.received if m["type"] == "heard"]
     assert [m["text"] for m in heard] == [
         "I'd like",
@@ -460,12 +494,20 @@ TWO_TURNS = [
     ev(1.90, T.FINAL_TRANSCRIPT, "And my savings."),
     ev(1.90, T.END_OF_SPEECH),
 ]
+# the same with LiveKit's commit of the first turn before the second begins (an early reply waits for that
+# commit, and rule 8 holds a guess until it)
+TWO_TURNS_COMMITTED = sorted(
+    [*TWO_TURNS, ev(1.20, COMMIT, "I'd like to check my balance.")], key=lambda e: e[0]
+)
 
 
-async def test_conversation_opened_mid_turn_starts_with_the_next_turn():
+@pytest.mark.parametrize(
+    "v, script", [(2, TWO_TURNS), (3, TWO_TURNS_COMMITTED)], ids=["api-v2", "api-v3"]
+)
+async def test_conversation_opened_mid_turn_starts_with_the_next_turn(v, script):
     # ready comes about 0.3 s into the first turn: nothing of that turn is sent, the second turn is
-    api = FakeAPI(answers={"and my": "and my savings please"}, v=2, ready_after=0.5)
-    out, counts = await wrapped_run(TWO_TURNS, api)
+    api = FakeAPI(answers={"and my": "and my savings please"}, v=v, ready_after=0.5)
+    out, counts = await wrapped_run(script, api)
     sent = [(m["type"], m["text"]) for m in api.received]
     assert sent == [
         ("heard", "and my"),
@@ -695,9 +737,9 @@ async def test_held_guess_refused_when_the_stts_own_early_start_replaces_livekit
     assert "guess_sent" not in counts
 
 
-async def test_no_hold_after_a_final_livekit_found_unchanged():
-    # the speech-to-text's own early start had the final's words: LiveKit makes no early reply of its own at that final
-    # (the one waiting is the speech-to-text's), so rule 8 holds nothing and the next turn's guess is sent
+async def test_no_hold_after_a_final_livekit_found_unchanged_from_a_version_2_api():
+    # as 1.8.13 (today's production): the speech-to-text's own early start had the final's words, LiveKit makes no early
+    # reply of its own at that final, rule 8 holds nothing and the next turn's guess is sent
     script = [
         ev(0.00, T.START_OF_SPEECH),
         ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
@@ -709,6 +751,74 @@ async def test_no_hold_after_a_final_livekit_found_unchanged():
     out, counts = await wrapped_run(script, FakeAPI(answers=SAVINGS, v=2))
     assert (T.PREFLIGHT_TRANSCRIPT, "and my savings please.") in out
     assert counts["guess_sent"] == 1 and "guess_held_while_livekit_waits" not in counts
+
+
+async def test_hold_after_a_final_equal_to_the_stts_own_early_start():
+    # version 3: the speech-to-text's own early start had the final's words: LiveKit makes no early reply of its own at
+    # that final, and the one waiting for its commit is the speech-to-text's; the next turn's guess would replace it, so
+    # rule 8 holds it (before 1.9.0, nothing was held here)
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.20, T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.", 0.95),
+        ev(0.30, T.FINAL_TRANSCRIPT, "I'd like to check my balance."),
+        ev(0.30, T.END_OF_SPEECH),
+        *AFTER,
+    ]
+    out, counts = await wrapped_run(script, FakeAPI(answers=SAVINGS, v=3))
+    assert out == await plain_run(script)
+    assert counts["guess_held_while_livekit_waits"] == 1
+    assert counts["held_guess_not_sent_turn_over"] == 1 and "guess_sent" not in counts
+
+
+# Bell's guess kept at a final waits for LiveKit's commit like LiveKit's own early reply; a guess on the
+# next turn's words, sent before that commit, replaced it, and when LiveKit then committed the first turn's words alone
+# its reply started at the commit (seen in a replayed call, with a guess that was always right)
+KEPT_TURN = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+    ev(0.30, T.FINAL_TRANSCRIPT, "I'd like to check my balance."),
+    ev(0.30, T.END_OF_SPEECH),
+]
+KEPT_ANSWERS = {"I'd like to check": "I'd like to check my balance.", **SAVINGS}
+
+
+@pytest.mark.parametrize(
+    "commit_at, sent, count",
+    [
+        pytest.param(None, False, "held_guess_not_sent_turn_over", id="kept-guess-waits-all-turn"),
+        pytest.param(0.80, False, "held_guess_not_sent_commit", id="livekit-commits-after-the-guess"),
+        pytest.param(0.45, True, None, id="livekit-committed-before-the-guess"),
+    ],
+)
+async def test_guess_held_while_bells_kept_guess_waits(commit_at, sent, count):
+    script = [*KEPT_TURN, *AFTER]
+    if commit_at is not None:
+        script = sorted(
+            [*script, ev(commit_at, COMMIT, "I'd like to check my balance.")], key=lambda e: e[0]
+        )
+    out, counts = await wrapped_run(script, FakeAPI(answers=KEPT_ANSWERS, v=3))
+    guesses = [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT]
+    # the first turn's guess is sent and kept: the final equals it
+    assert guesses[0] == (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.")
+    if sent:
+        assert guesses[1:] == [(T.PREFLIGHT_TRANSCRIPT, "and my savings please.")]
+        assert counts["guess_sent"] == 2 and "guess_held_while_livekit_waits" not in counts
+    else:
+        assert guesses[1:] == []
+        assert counts["guess_sent"] == 1
+        assert counts["guess_held_while_livekit_waits"] == 1 and counts[count] == 1
+
+
+async def test_a_kept_guess_holds_nothing_from_a_version_2_api():
+    # as 1.8.13 (today's production): the next turn's guess is sent though the first turn's kept guess waits
+    out, counts = await wrapped_run([*KEPT_TURN, *AFTER], FakeAPI(answers=KEPT_ANSWERS, v=2))
+    guesses = [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT]
+    assert guesses == [
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance."),
+        (T.PREFLIGHT_TRANSCRIPT, "and my savings please."),
+    ]
+    assert counts["guess_sent"] == 2 and "guess_held_while_livekit_waits" not in counts
 
 
 @pytest.mark.parametrize(
@@ -789,6 +899,7 @@ def _rabel_lines(caplog):
         pytest.param(1, {}, id="api-v1"),
         pytest.param(2, {}, id="api-v2"),
         pytest.param(2, {"hold_always": True, "hold_updates": 2}, id="api-v2-other-fields-ignored"),
+        pytest.param(3, {}, id="api-v3-without-the-hold-fields"),
     ],
 )
 async def test_rule_3_holds_one_unsure_update_at_the_line(v, extra, caplog):
@@ -812,6 +923,119 @@ async def test_rule_3_holds_one_unsure_update_at_the_line(v, extra, caplog):
     )
     assert "tail_held" not in counts and counts["guess_cancelled_by_words"] == 1
     assert _rabel_lines(caplog) == []
+
+
+# the hold rule moved (1.9.0): rule 3's two settings from a version 3
+# `ready`, `hold_always` (any last word, whatever its confidence) and `hold_updates` (1 or 2). Absent or bad, the
+# published rule: the line, one update; a bad value logs one line.
+
+
+@pytest.mark.parametrize(
+    "extra, held, logged",
+    [
+        pytest.param({}, False, 0, id="absent-the-line-applies"),
+        pytest.param({"hold_always": False}, False, 0, id="false-the-line-applies"),
+        pytest.param({"hold_always": True}, True, 0, id="true-any-last-word"),
+        pytest.param({"hold_always": None}, False, 0, id="null-as-absent"),
+        pytest.param({"hold_always": "yes"}, False, 1, id="bad-default-and-one-line"),
+        pytest.param({"hold_always": 1}, False, 1, id="a-number-is-bad"),
+    ],
+)
+async def test_hold_always_from_ready_holds_a_sure_last_word(extra, held, logged, caplog):
+    caplog.set_level(logging.WARNING, logger="livekit.plugins.rabel")
+    # a last word the speech-to-text is sure of (0.97, over the line 0.9): today's rule 3 does not hold it
+    api = FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=extra)
+    out, counts = await wrapped_run(_hold_script(("bill", 0.97)), api)
+    if held:
+        assert out == KEPT
+        assert counts["tail_held"] == 1 and counts["hold_agreed"] == 1
+    else:
+        assert (T.INTERIM_TRANSCRIPT, "check my bill") in out
+        assert "tail_held" not in counts and counts["guess_cancelled_by_words"] == 1
+    lines = _rabel_lines(caplog)
+    assert len(lines) == logged, lines
+    if logged:
+        assert "hold_always" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "extra, kept, logged",
+    [
+        pytest.param({}, False, 0, id="absent-one-update"),
+        pytest.param({"hold_updates": 1}, False, 0, id="one-update"),
+        pytest.param({"hold_updates": 2}, True, 0, id="two-updates"),
+        pytest.param({"hold_updates": 2.0}, True, 0, id="two-as-a-float"),
+        pytest.param({"hold_updates": 3}, False, 1, id="three-out-of-range-default-and-one-line"),
+        pytest.param({"hold_updates": 0}, False, 1, id="zero-out-of-range"),
+        pytest.param({"hold_updates": True}, False, 1, id="true-is-bad"),
+        pytest.param({"hold_updates": "2"}, False, 1, id="a-string-is-bad"),
+    ],
+)
+async def test_hold_updates_from_ready(extra, kept, logged, caplog):
+    caplog.set_level(logging.WARNING, logger="livekit.plugins.rabel")
+    # two unsure last words in a row ("bill", then "bell"), each under the line, then the words agree again
+    api = FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=extra)
+    out, counts = await wrapped_run(_hold_script(("bill", 0.4), ("bell", 0.4)), api)
+    assert counts["tail_held"] == 1
+    if kept:
+        # held a second update, then dropped because the next interim agrees: the guess stays the running early start
+        assert out == KEPT
+        assert counts["tail_held_again"] == 1 and counts["hold_agreed"] == 1
+    else:
+        # one update only: the second interim is passed and cancels the guess
+        assert (T.INTERIM_TRANSCRIPT, "check my bell") in out
+        assert (T.INTERIM_TRANSCRIPT, "check my bill") not in out
+        assert counts["hold_passed"] == 1 and "tail_held_again" not in counts
+    lines = _rabel_lines(caplog)
+    assert len(lines) == logged, lines
+    if logged:
+        assert "hold_updates" in lines[0]
+
+
+async def test_hold_updates_two_never_holds_a_third_nor_a_sure_word():
+    # a third unsure update in a row is passed (it cancels the guess)
+    two = {"hold_updates": 2}
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.4), ("bell", 0.4), ("ball", 0.4)),
+        FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=two),
+    )
+    assert (T.INTERIM_TRANSCRIPT, "check my ball") in out and counts["tail_held_again"] == 1
+    assert counts["hold_passed"] == 1
+    # the second update is held only if it too is unsure (under the line), unless hold_always is true
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.4), ("bell", 0.97)), FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=two)
+    )
+    assert (T.INTERIM_TRANSCRIPT, "check my bell") in out and "tail_held_again" not in counts
+    both = {"hold_updates": 2, "hold_always": True}
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.97), ("bell", 0.97)), FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=both)
+    )
+    assert out == KEPT and counts["tail_held"] == 1 and counts["tail_held_again"] == 1
+
+
+async def test_hold_settings_as_the_api_serves_them():
+    # the API's own values for a version 3 hello: hold_always true, hold_updates 1. A last word the speech-to-text is
+    # sure of is held one update; a second differing update is passed
+    served = {"hold_always": True, "hold_updates": 1}
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.97)), FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=served)
+    )
+    assert out == KEPT and counts["tail_held"] == 1 and counts["hold_agreed"] == 1
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.97), ("bell", 0.97)),
+        FakeAPI(answers=HOLD_GUESS, v=3, ready_extra=served),
+    )
+    assert (T.INTERIM_TRANSCRIPT, "check my bell") in out and counts["hold_passed"] == 1
+
+
+async def test_hold_settings_absent_from_a_version_1_api_keep_today_rule():
+    # a version 1 API sends a bare ready: the line 0.9 and one update, exactly as before the settings existed
+    out, counts = await wrapped_run(
+        _hold_script(("bill", 0.4), ("bell", 0.4)), FakeAPI(answers=HOLD_GUESS, v=1)
+    )
+    assert (T.INTERIM_TRANSCRIPT, "check my bell") in out and counts["hold_passed"] == 1
+    out, counts = await wrapped_run(_hold_script(("bill", 0.97)), FakeAPI(answers=HOLD_GUESS, v=1))
+    assert "tail_held" not in counts and counts["guess_cancelled_by_words"] == 1
 
 
 async def test_part_word_interims_agree_with_the_guess():
@@ -873,11 +1097,19 @@ async def test_no_guess_as_third_early_start_and_none_equal_to_words():
         ev(0.70, T.FINAL_TRANSCRIPT, "Yes, please do it."),
         ev(0.70, T.END_OF_SPEECH),
     ]
-    api = FakeAPI(answers={"yes please do": "yes please do it", "yes": "yes"}, v=2)
-    out, counts = await wrapped_run(script, api)
-    assert (T.PREFLIGHT_TRANSCRIPT, "yes please do it") not in out
-    assert counts["guess_third_start"] == 1 and counts["guess_equals_words"] == 1
-    assert out == await plain_run(script)
+    for v in (2, 3):
+        api = FakeAPI(answers={"yes please do": "yes please do it", "yes": "yes"}, v=v)
+        out, counts = await wrapped_run(script, api)
+        assert (T.PREFLIGHT_TRANSCRIPT, "yes please do it") not in out
+        assert counts["guess_third_start"] == 1
+        if v == 2:
+            # as 1.8.13: a guess must add words to the words it was made from
+            assert counts["guess_equals_words"] == 1
+        else:
+            # version 3: a guess equal to its words is the end bet, taken; this one equals the speech-to-text's running
+            # start
+            assert counts["guess_same_as_running"] == 1
+        assert out == await plain_run(script)
 
 
 async def test_guess_reached_by_the_words_before_it_arrives_is_sent():
@@ -905,6 +1137,174 @@ async def test_guess_reached_by_the_words_before_it_arrives_is_sent():
     assert "guess_equals_words" not in counts
 
 
+
+# ------------------------------------------------------------------ guessing again (version 3, rule 6a)
+
+# Bell's first guess "...check my balance" is cancelled by the words ("...check my savings"); Bell guesses again from
+# those words and the new guess is the next early start
+AGAIN = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+    ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+    ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my savings account", 0.95),
+    ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings account."),
+    ev(0.80, T.END_OF_SPEECH),
+]
+AGAIN_ANSWERS = {
+    "I'd like to check": "i'd like to check my balance",
+    "I'd like to check my savings": "i'd like to check my savings account",
+}
+
+
+async def test_a_new_guess_after_the_words_cancelled_the_first_is_sent_and_kept():
+    api = FakeAPI(answers=AGAIN_ANSWERS, v=3)
+    out, counts = await wrapped_run(AGAIN, api)
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance."),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check my savings"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings account."),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check my savings account"),
+        (T.FINAL_TRANSCRIPT, "I'd like to check my savings account."),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["guess_sent"] == 2 and counts["guess_cancelled_by_words"] == 1
+    assert "guess_not_first" not in counts
+    last = dict(api.received[-1])
+    assert isinstance(last.pop("head_start_ms"), int)
+    assert last["type"] == "end_of_turn" and last["guess"] == "kept"
+
+
+async def test_one_guess_alive_a_guess_while_the_first_runs_is_not_sent():
+    # the second guess comes while the first is the running early start and the words still agree with it
+    api = FakeAPI(answers={**GUESS_AT_CHECK, "I'd like to check my": "i'd like to check my card"}, v=3)
+    out, counts = await wrapped_run(TURN, api)
+    assert [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT] == [
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.")
+    ]
+    assert counts["guess_sent"] == 1 and counts["guess_while_live"] == 1
+
+
+async def test_guessing_again_never_takes_the_third_early_start():
+    # two guesses each cancelled by the words have taken two of LiveKit's three early starts: a third is not sent, and
+    # the final keeps the last start
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+        ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my savings balance", 0.95),
+        ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings balance today."),
+        ev(0.80, T.END_OF_SPEECH),
+    ]
+    answers = {
+        **AGAIN_ANSWERS,
+        "I'd like to check my savings balance": "i'd like to check my savings balance today",
+    }
+    out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    assert counts["guess_sent"] == 2 and counts["guess_cancelled_by_words"] == 2
+    assert counts["guess_third_start"] == 1
+    assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings balance today.") not in out
+
+
+async def test_no_new_guess_after_the_stts_own_early_start_replaced_bells():
+    # the speech-to-text's own early start replaces Bell's running guess: with Bell's guess it has taken two of LiveKit's
+    # three early starts, so no new guess is sent (the last start is the final's)
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.20, T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings", 0.95),
+        ev(0.45, T.INTERIM_TRANSCRIPT, "I'd like to check my savings account", 0.95),
+        ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings account."),
+        ev(0.80, T.END_OF_SPEECH),
+    ]
+    out, counts = await wrapped_run(script, FakeAPI(answers=AGAIN_ANSWERS, v=3))
+    assert counts["guess_sent"] == 1 and counts["guess_third_start"] == 1
+    assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings account.") not in out
+
+
+@pytest.mark.parametrize(
+    "then, sent, waiting_dropped",
+    [
+        # the hold passes the unsure word: the new guess, made from it, is taken now
+        pytest.param("bill", ["check my balance.", "check my bill please."], 0, id="hold-passes-new-guess-taken"),
+        # the words agree with the running guess again: it stands and the waiting guess is dropped
+        pytest.param("balance", ["check my balance."], 1, id="hold-agrees-waiting-guess-dropped"),
+    ],
+)
+async def test_a_new_guess_during_rule_3s_hold_waits_for_its_outcome(then, sent, waiting_dropped):
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "check my", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "check my bill", 0.4),
+        ev(0.45, T.INTERIM_TRANSCRIPT, f"check my {then}", 0.4),
+        ev(0.70, T.FINAL_TRANSCRIPT, "check my bill please." if then == "bill" else "check my balance."),
+        ev(0.70, T.END_OF_SPEECH),
+    ]
+    api = FakeAPI(answers={**HOLD_GUESS, "check my bill": "check my bill please"}, v=3)
+    out, counts = await wrapped_run(script, api)
+    assert [e[1] for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT] == sent
+    assert counts["guess_waits_on_hold"] == 1 and counts["guess_sent"] == len(sent)
+    assert counts.get("waiting_guess_dropped", 0) == waiting_dropped
+    last = api.received[-1]
+    assert last["type"] == "end_of_turn" and last["guess"] == "kept"
+
+
+
+# ------------------------------------------------------------------ the end bet (version 3)
+
+
+async def test_the_end_bet_is_sent_on_the_words_so_far_and_kept():
+    # a guess equal to the words it was made from: Bell bets the turn is over there; it is sent as the early start on
+    # the words exactly as the speech-to-text showed them, and kept when the turn ends on them
+    said = "I'd like to check my balance."
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, said, 0.95),
+        ev(0.40, T.FINAL_TRANSCRIPT, said),
+        ev(0.40, T.END_OF_SPEECH),
+    ]
+    api = FakeAPI(answers={said: "i'd like to check my balance"}, v=3)
+    out, counts = await wrapped_run(script, api)
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, said),
+        (T.PREFLIGHT_TRANSCRIPT, said),
+        (T.FINAL_TRANSCRIPT, said),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["guess_sent"] == 1 and counts["end_bet_sent"] == 1
+    assert "guess_equals_words" not in counts and "guess_reached_by_words" not in counts
+    last = dict(api.received[-1])
+    assert isinstance(last.pop("head_start_ms"), int)
+    assert last == {"type": "end_of_turn", "text": said, "guess": "kept"}
+
+
+async def test_an_end_bet_the_caller_goes_past_is_cancelled_and_bell_may_bet_again():
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my balance", 0.95),
+        ev(0.60, T.FINAL_TRANSCRIPT, "I'd like to check my balance"),
+        ev(0.60, T.END_OF_SPEECH),
+    ]
+    answers = {
+        "I'd like to check": "i'd like to check",
+        "I'd like to check my balance": "i'd like to check my balance",
+    }
+    out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check"),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check my balance"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance"),
+        (T.FINAL_TRANSCRIPT, "I'd like to check my balance"),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["end_bet_sent"] == 2 and counts["guess_cancelled_by_words"] == 1
+
+
 # ------------------------------------------------------------------ the ways speech-to-text services send words
 #
 # Each script gives, with made-up words, the events a LiveKit speech-to-text plugin makes in one of these patterns:
@@ -917,6 +1317,70 @@ async def test_guess_reached_by_the_words_before_it_arrives_is_sent():
 #   Last words in one burst: an interim when the words change; a turn's last words come in one burst, with the service's
 #     own early end -> PREFLIGHT_TRANSCRIPT; a resume -> an interim of the same words (it withdraws nothing by itself: the
 #     next update moves past them); the turn's end -> FINAL_TRANSCRIPT and END_OF_SPEECH.
+
+
+@pytest.mark.parametrize("v", [1, 2], ids=["api-v1", "api-v2"])
+async def test_one_guess_a_turn_and_no_end_bet_from_an_api_that_is_not_version_3(v):
+    # as 1.8.13 (today's production): a second guess in the turn is not sent, though the words cancelled the first
+    out, counts = await wrapped_run(AGAIN, FakeAPI(answers=AGAIN_ANSWERS, v=v))
+    assert [e[1] for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT] == ["I'd like to check my balance."]
+    assert counts["guess_sent"] == 1 and counts["guess_not_first"] == 1
+    # a guess equal to the words it was made from is not sent
+    said = "I'd like to check my balance."
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, said, 0.95),
+        ev(0.40, T.FINAL_TRANSCRIPT, said),
+        ev(0.40, T.END_OF_SPEECH),
+    ]
+    out, counts = await wrapped_run(script, FakeAPI(answers={said: "i'd like to check my balance"}, v=v))
+    assert out == await plain_run(script)
+    assert counts["guess_equals_words"] == 1 and "end_bet_sent" not in counts
+
+
+# ------------------------------------------------------------------ min_chance with the new Bell (version 3)
+
+
+@pytest.mark.parametrize(
+    "stt_kw, chance, sent, dropped",
+    [
+        # none set: the hello leaves it out, `ready` says null, and the API's balanced setting decides alone
+        pytest.param({}, 0.56, True, None, id="none-set-a-guess-under-0.67-is-used"),
+        # set: the API raises its bars to it, `ready` says it, and a guess under it is not used
+        pytest.param({"min_chance": 0.8}, 0.75, False, "guess_below_min_chance", id="set-0.8-under-it"),
+        pytest.param({"min_chance": 0.8}, 0.8, True, None, id="set-0.8-at-it"),
+    ],
+)
+async def test_min_chance_with_a_version_3_api(stt_kw, chance, sent, dropped):
+    api = FakeAPI(answers=GUESS_AT_CHECK, v=3, chance=chance)
+    out, counts = await wrapped_run(TURN, api, **stt_kw)
+    assert ("min_chance" in api.hello) == bool(stt_kw)
+    if sent:
+        assert counts["guess_sent"] == 1
+    else:
+        assert out == await plain_run(TURN) and counts[dropped] == 1
+
+
+async def test_a_version_3_guess_without_chance_is_not_used():
+    api = FakeAPI(answers=GUESS_AT_CHECK, v=3, send_chance=False)
+    out, counts = await wrapped_run(TURN, api)
+    assert out == await plain_run(TURN)
+    assert counts["guess_no_chance"] == 1 and "guess_sent" not in counts
+
+
+async def test_the_api_version_is_read_from_ready():
+    for v, want in ((1, False), (2, False), (3, True)):
+        api = FakeAPI(v=v)
+        runner, url = await serve(api)
+        try:
+            async with aiohttp.ClientSession() as http:
+                w = rabel.STT(ScriptedSTT(TURN), api_key="test", base_url=url, http_session=http)
+                stream = w.stream()
+                await asyncio.sleep(0.3)
+                assert stream._bell is not None and stream._bell.v3 is want
+                await stream.aclose()
+        finally:
+            await runner.cleanup()
 
 
 async def test_flux_steady_updates_and_its_eager_end_of_turn_on_bells_words():
@@ -1685,11 +2149,14 @@ async def test_report_kept_stays_kept_after_livekit_commits(committed):
         assert ends[0]["guess"] == "dropped" and "head_start_ms" not in ends[0], ends
 
 
-async def test_log_lines_kept_and_summary_carry_no_words(caplog):
+@pytest.mark.parametrize(
+    "v, script", [(2, TWO_TURNS), (3, TWO_TURNS_COMMITTED)], ids=["api-v2", "api-v3"]
+)
+async def test_log_lines_kept_and_summary_carry_no_words(v, script, caplog):
     caplog.set_level(logging.DEBUG, logger="livekit.plugins.rabel")
     answers = {"I'd like to check": GUESS_BALANCE, "and my": "and my savings please"}
-    api = FakeAPI(answers=answers, v=2)
-    out, stream, ends = await report_run(TWO_TURNS, api)
+    api = FakeAPI(answers=answers, v=v)
+    out, stream, ends = await report_run(script, api)
     assert [m["guess"] for m in ends] == ["kept", "dropped"]
     hs = ends[0]["head_start_ms"]
     recs = [r for r in caplog.records if r.name == "livekit.plugins.rabel"]
@@ -1718,9 +2185,54 @@ async def test_log_lines_kept_and_summary_carry_no_words(caplog):
     base = set(vars(logging.makeLogRecord({})))
     for r in recs:
         assert not set(words_of(r.getMessage())) & said, r.getMessage()
-        for k, v in vars(r).items():
-            if k not in base and isinstance(v, str):
-                assert not set(words_of(v)) & said, (k, v)
+        for k, val in vars(r).items():
+            if k not in base and isinstance(val, str):
+                assert not set(words_of(val)) & said, (k, val)
+
+
+
+# the status with more than one guess a turn (version 3): the report's `guess` is the last guess's, `dropped_before` the
+# guesses dropped before it; the summary counts every guess
+THIRD_REFUSED = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+    ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+    ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my savings balance", 0.95),
+    ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings balance."),
+    ev(0.80, T.END_OF_SPEECH),
+]
+
+
+@pytest.mark.parametrize(
+    "script, last, summary",
+    [
+        # the first dropped by the words, the second kept
+        pytest.param(AGAIN, "kept", (1, 2, 1, 1), id="dropped-then-kept"),
+        # both dropped by the words
+        pytest.param(THIRD_REFUSED, "dropped", (1, 2, 0, 2), id="dropped-twice"),
+    ],
+)
+async def test_report_and_summary_count_every_guess_of_a_turn(script, last, summary, caplog):
+    caplog.set_level(logging.INFO, logger="livekit.plugins.rabel")
+    api = FakeAPI(answers=AGAIN_ANSWERS, v=3)
+    out, stream, ends = await report_run(script, api)
+    assert len(ends) == 1
+    end = dict(ends[0])
+    hs = end.pop("head_start_ms", None)
+    assert (hs is not None) == (last == "kept")
+    assert end == {"type": "end_of_turn", "text": script[-2][2], "guess": last, "dropped_before": 1}
+    s = stream.summary
+    assert (s["turns"], s["guesses"], s["kept"], s["dropped"]) == summary
+    line = [r for r in caplog.records if "head start in all" in r.getMessage()]
+    assert len(line) == 1 and (line[0].guesses, line[0].kept, line[0].dropped) == summary[1:]
+
+
+async def test_report_with_one_guess_a_turn_is_as_published():
+    # one guess: no `dropped_before`, the report exactly as the published hookup sends it
+    api = FakeAPI(answers=GUESS_AT_CHECK, v=3)
+    out, stream, ends = await report_run(TURN, api)
+    assert len(ends) == 1 and "dropped_before" not in ends[0] and ends[0]["guess"] == "kept"
+    assert (stream.summary["guesses"], stream.summary["kept"], stream.summary["dropped"]) == (1, 1, 0)
 
 
 async def test_report_off_leaves_the_field_out():
@@ -1778,13 +2290,13 @@ async def test_user_sent_in_the_hello_when_set():
                 user="cust-42:a_b.c",
             )
             await collect(w, wait_ready=w)
-            assert api.hello == {**hello_v2(), "user": "cust-42:a_b.c"}
+            assert api.hello == {**hello_v3(), "user": "cust-42:a_b.c"}
             w.update_options(user=None)  # from the next stream, not sent
             await collect(w, wait_ready=w)
-            assert api.hello == hello_v2()
+            assert api.hello == hello_v3()
             w.update_options(user="Z" * 128)
             await collect(w, wait_ready=w)
-            assert api.hello == {**hello_v2(), "user": "Z" * 128}
+            assert api.hello == {**hello_v3(), "user": "Z" * 128}
     finally:
         await runner.cleanup()
 

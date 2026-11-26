@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One conversation with the Rabel API (`WS /v1/conversation`, its version 2), kept open for a speech stream.
+"""One conversation with the Rabel API (`WS /v1/conversation`), kept open for a speech stream.
 
-Hello: the first message carries `key`, `v` (2), `agent`, `host`, `host_version`, `hookup`, `vendor`, `min_chance`
-and `learn`, and `user` when the developer set one. It is sent without a `type` field: a version 2 API reads a first
-message with a `key` and no `type` as the hello, and that is the form a version 1 API has always read.
+Hello: the first message carries `key`, `type` ("hello"), `v` (3: the hookup takes the new Bell), `agent`, `host`,
+`host_version`, `hookup`, `vendor` and `learn`, `min_chance` only when the developer set one, and `user` when the
+developer set one. An API that serves the new Bell answers with a version 3 `ready`; one that does not reads the same
+hello as a version 2 hello and answers with a version 2 `ready`, and this client then behaves as the published 1.8.13.
 In: `{"type": "heard", "text"}` with the turn's words so far, `{"type": "end_of_turn", "text"}` with its final words
-and, unless the report is off, `guess` ("none", "kept" or "dropped") and with "kept" `head_start_ms`.
-Out: `ready` (version 2 adds `min_chance` and `hold_line`), `guess` (`text`, `heard`; version 2 adds `chance`),
-`end_of_turn`, `error` (`status`, `error`, `message`, `retry_after_s`). Fields this client does not know are ignored, so a version 1 API works.
+and, unless the report is off, `guess` ("none", "kept" or "dropped") and with "kept" `head_start_ms`; on a turn with more than
+one guess (version 3), `guess` is what happened to the last and `dropped_before` counts the ones before it, each dropped.
+Out: `ready` (version 2 adds `min_chance` and `hold_line`; version 3 adds `hold_always` and `hold_updates`, and its
+`min_chance` is null when the developer set none), `guess` (`text`, `heard`; version 2 and 3 add `chance`),
+`end_of_turn`, `error` (`status`, `error`, `message`, `retry_after_s`). Fields this client does not know are ignored,
+so a version 1 API works. `hold_always` and `hold_updates` are read from a version 3 `ready` only.
 
 Nothing here ever raises into the caller. Words are sent only while the API is ready; before that, and after any failure,
 they are dropped and the speech stream runs as a plain pass-through. Each kind of failure is logged once.
@@ -78,7 +82,10 @@ class BellConnection:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ready = False
         self._hold_line: float | None = None
+        self._hold_always: bool | None = None
+        self._hold_updates: int | None = None
         self._min_chance: float | None = None
+        self._v3 = False  # the open conversation's `ready` said version 3: the new Bell
         self._conversation = 0  # counts the conversations that reached ready
         self._closed = False
         self._logged: set[str] = set()
@@ -102,13 +109,32 @@ class BellConnection:
         return self._conversation
 
     @property
+    def v3(self) -> bool:
+        """The open conversation serves the new Bell (its `ready` said `"v": 3`); False before a ready and with an API
+        that answered with a version 1 or 2 `ready`."""
+        return self._v3
+
+    @property
     def hold_line(self) -> float | None:
         """Rule 3's line from the API's `ready` (version 2), or None when the API did not send one."""
         return self._hold_line
 
     @property
+    def hold_always(self) -> bool | None:
+        """Rule 3 for any last word, whatever its confidence, from the API's version 3 `ready`; None when the API did not
+        send it, sent a value that is not true or false, or answered with a version 1 or 2 `ready`."""
+        return self._hold_always
+
+    @property
+    def hold_updates(self) -> int | None:
+        """How many updates in a row rule 3 may hold an interim (1 or 2), from the API's version 3 `ready`; None when the
+        API did not send it, sent a value out of range, or answered with a version 1 or 2 `ready`."""
+        return self._hold_updates
+
+    @property
     def min_chance(self) -> float | None:
-        """The min_chance in force, from the API's `ready` (version 2), or None when the API did not send one."""
+        """The min_chance in force, from the API's `ready` (version 2), or None when the API did not send one (a version
+        1 API, or a version 3 `ready` for a developer who set none: the new Bell's balanced setting)."""
         return self._min_chance
 
     def log_once(self, kind: str, line: str) -> None:
@@ -124,15 +150,23 @@ class BellConnection:
         self._send({"type": "heard", "text": text})
 
     def end_of_turn(
-        self, text: str, guess: str | None = None, head_start_ms: int | None = None
+        self,
+        text: str,
+        guess: str | None = None,
+        head_start_ms: int | None = None,
+        dropped_before: int = 0,
     ) -> None:
         """The turn's final words, and when given, the report of what happened to Bell's guess in the turn (the Rabel
-        API's docs): `guess` "none", "kept" or "dropped", and with "kept" the head start in ms."""
+        API's docs): `guess` "none", "kept" or "dropped", and with "kept" the head start in ms. With more than one guess
+        in the turn, `guess` is the last one's and `dropped_before` the number of guesses dropped before it (sent only
+        when there were any, so a turn with one guess reports as before)."""
         msg: dict[str, Any] = {"type": "end_of_turn", "text": text}
         if guess is not None:
             msg["guess"] = guess
             if guess == "kept" and head_start_ms is not None:
                 msg["head_start_ms"] = head_start_ms
+            if dropped_before > 0:
+                msg["dropped_before"] = dropped_before
         self._send(msg)
 
     def _send(self, msg: dict[str, Any]) -> None:
@@ -277,7 +311,7 @@ class BellConnection:
         refusal: dict[str, Any] | None = None
         clean = False
         try:
-            # the hello: the key and no `type`, which version 1 and version 2 both read as the hello
+            # the hello: `"type": "hello"` with `"v": 3`; an API without the new Bell reads it as a version 2 hello
             await ws.send_str(json.dumps({"key": self._api_key, **self._hello}))
             while True:
                 if opened_at is None:
@@ -298,7 +332,19 @@ class BellConnection:
                     continue
                 kind = m.get("type") if isinstance(m, dict) else None
                 if kind == "ready" and opened_at is None:
+                    v = m.get("v")
+                    self._v3 = v == 3 and not isinstance(v, bool)
                     self._hold_line = _unit_number(m.get("hold_line"))
+                    if self._v3:
+                        self._hold_always = self._setting(
+                            m, "hold_always", _true_or_false, "true or false"
+                        )
+                        self._hold_updates = self._setting(
+                            m, "hold_updates", _hold_updates, "1 or 2"
+                        )
+                    else:
+                        # a version 1 or 2 ready: rule 3 as published (1.8.13), whatever else it carries
+                        self._hold_always = self._hold_updates = None
                     self._min_chance = _unit_number(m.get("min_chance"))
                     self._conversation += 1
                     opened_at = time.monotonic()
@@ -326,6 +372,20 @@ class BellConnection:
             with contextlib.suppress(Exception):
                 await ws.close()
 
+    def _setting(self, m: dict[str, Any], name: str, read: Callable[[Any], Any], want: str) -> Any:
+        """A rule-3 setting from `ready`: None when absent (a version 1 API, or one that does not send it); None and one
+        logged line when it is not a value this client takes, so today's rule is used."""
+        v = m.get(name)
+        if v is None:
+            return None
+        got = read(v)
+        if got is None:
+            self._log_once(
+                f"bad_{name}",
+                f"Bell: the Rabel API sent {name} {v!r}, not {want}; the default is used",
+            )
+        return got
+
     async def _send_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while True:
             data = await self._out.get()
@@ -338,3 +398,14 @@ def _unit_number(v: Any) -> float | None:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.0 <= v <= 1.0:
         return None
     return float(v)
+
+
+def _true_or_false(v: Any) -> bool | None:
+    return v if isinstance(v, bool) else None
+
+
+def _hold_updates(v: Any) -> int | None:
+    """1 or 2 (an int, or a float with that value), else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v not in (1, 2):
+        return None
+    return int(v)

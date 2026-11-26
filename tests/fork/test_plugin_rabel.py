@@ -308,20 +308,26 @@ TWO_TURNS = [
     ev(1.90, T.FINAL_TRANSCRIPT, "And my savings."),
     ev(1.90, T.END_OF_SPEECH),
 ]
+# the same with LiveKit's commit of the first turn before the second begins (an early reply waits for that
+# commit, and rule 8 holds a guess until it)
+TWO_TURNS_COMMITTED = sorted(
+    [*TWO_TURNS, ev(1.20, COMMIT, "I'd like to check my balance.")], key=lambda e: e[0]
+)
 GUESS_BALANCE = "i'd like to check my balance"
 AT_CHECK = {"I'd like to check": GUESS_BALANCE}
 
 
-def hello_v2(**kw: Any) -> dict:
+def hello_v3(**kw: Any) -> dict:
+    """the hello the hookup sends: `"type": "hello"` and `"v": 3`; `min_chance` only when the developer set one"""
     return {
         "key": "test",
-        "v": 2,
+        "type": "hello",
+        "v": 3,
         "agent": "default",
         "host": "livekit",
         "host_version": agents_version,
         "hookup": rabel.__version__,
         "vendor": "scripted/script-1",
-        "min_chance": 0.7,
         "learn": True,
         **kw,
     }
@@ -330,14 +336,14 @@ def hello_v2(**kw: Any) -> dict:
 # ------------------------------------------------------------------ the hello and the options
 
 
-async def test_hello_carries_version_2_fields_and_options_change_from_the_next_stream() -> None:
+async def test_hello_announces_version_3_and_options_change_from_the_next_stream() -> None:
     api = FakeAPI()
     w = wrapper(TURN, api, agent="front-desk", user="cust-42:a_b.c")
     await collect(w)
-    assert api.hello == hello_v2(agent="front-desk", user="cust-42:a_b.c")
+    assert api.hello == hello_v3(agent="front-desk", user="cust-42:a_b.c")
     w.update_options(agent="demo-bank", min_chance=0.9, learn=False, user=None)
     await collect(w)
-    assert api.hello == hello_v2(agent="demo-bank", min_chance=0.9, learn=False)
+    assert api.hello == hello_v3(agent="demo-bank", min_chance=0.9, learn=False)
 
 
 @pytest.mark.parametrize(
@@ -519,6 +525,7 @@ async def test_no_guess_as_third_early_start_and_none_equal_to_words() -> None:
     ]
     api = FakeAPI(answers={"yes please do": "yes please do it", "yes": "yes"})
     out, counts, _, _ = await wrapped_run(script, api)
+    # a version 2 API (this stand-in): a guess must add words to the words it was made from, as 1.8.13
     assert counts["guess_third_start"] == 1 and counts["guess_equals_words"] == 1
     assert out == await plain_run(script)
 
@@ -582,7 +589,7 @@ async def test_log_lines_written_with_the_report_on_or_off_and_carry_no_words(
     caplog.set_level(logging.DEBUG, logger="livekit.plugins.rabel")
     answers = {**AT_CHECK, "and my": "and my savings please"}
     api = FakeAPI(answers=answers)
-    out, _, summary, ends = await wrapped_run(TWO_TURNS, api, report=report)
+    out, _, summary, ends = await wrapped_run(TWO_TURNS_COMMITTED, api, report=report)
     if report:
         assert [m["guess"] for m in ends] == ["kept", "dropped"]
     else:  # the API is told nothing of the guesses

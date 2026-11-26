@@ -58,10 +58,12 @@ session = AgentSession(
 )
 ```
 
-A new agent starts with nothing learned, and Bell sends no guess until it has heard enough of that agent's calls. To see
-it work at once, use `agent="demo-bank"`: a ready-made agent that every account can use, already trained on a bank's
-callers (the Gridspace-Stanford Harper Valley dataset of simulated bank calls, CC BY 4.0). A conversation that sounds
-like a call to a bank gets guesses; talk on another topic rarely does. `demo-bank` never learns.
+A new agent starts with nothing learned, and Bell sends no guess until it has learned from enough of that agent's own
+calls. The API's `ready` message, which opens each conversation, carries `calls_heard`: how many of the agent's calls
+Bell has learned from. Your agent's status shows the same count under `v3` (see the Rabel API docs). To see it work at once, use
+`agent="demo-bank"`: a ready-made agent that every account can use, already trained on a bank's callers (the
+Gridspace-Stanford Harper Valley dataset of simulated bank calls, CC BY 4.0). A conversation that sounds like a call to
+a bank gets guesses; talk on another topic rarely does. `demo-bank` never learns.
 
 Any streaming speech-to-text with interim results can be wrapped. Bell goes with the speech-to-text's own early starts,
 not instead of them: on turns where Bell has no guess, the events are the speech-to-text's, unchanged. Preemptive
@@ -77,9 +79,12 @@ preemptive generation is on and Flux's eager end of turn is off. That is
 
 ## How a guess is handled
 
-- Bell sends at most one guess a turn, never one equal to the words it was made from, and only within `answer_timeout`
-  of those words, at or above `min_chance`, on the turn it answers. A turn is sent to Bell only if its first words are:
-  when the connection opens or reopens mid-turn, Bell starts with the next turn.
+- A guess is used only within `answer_timeout` of the words it was made from, on the turn it answers, and at or above
+  `min_chance` when you set one. A turn is sent to Bell only if its first words are: when the connection opens or
+  reopens mid-turn, Bell starts with the next turn.
+- One guess at a time is your agent's early reply. When the caller's words go another way, the reply started on that
+  guess is dropped, and Bell may send a new guess in the same turn. A guess can also be the words heard so far: Bell's
+  guess that the caller has finished.
 - The plugin keeps within LiveKit's default limits for preemptive generation (`max_retries` 3, `max_speech_duration`
   10 s): a guess is never the third early start of a turn and is never sent after 10 seconds of speech.
 - **With Flux's eager end of turn on**, Bell sends no guess once your speech-to-text has made its own early start in the
@@ -89,19 +94,20 @@ preemptive generation is on and Flux's eager end of turn is off. That is
 - While Bell's guess is the running early start, the plugin holds back the interim transcripts and the speech-to-text's
   own preflight that agree with it, because LiveKit would otherwise cancel the reply. Anything that disagrees is passed
   and cancels the wrong reply. The final words still decide whether the reply is kept.
-- While LiveKit's own early reply made on a final transcript waits for LiveKit's end of turn, the plugin holds Bell's
-  guess, which would replace that reply, and never sends it later. The plugin sees LiveKit's end of turn through the
-  session's `stt_context_options` `forward_chat_context`, on by default. With it off, the plugin holds every guess that
-  comes after LiveKit's own early start on a final.
+- While an early reply waits for LiveKit's end of turn (LiveKit's own, made on a final transcript, or one whose words a
+  final transcript has matched), the plugin holds Bell's guess, which would replace that reply, and never sends it
+  later. The plugin sees LiveKit's end of turn through the session's `stt_context_options` `forward_chat_context`, on by
+  default. With it off, the plugin holds every guess that comes after such a reply begins to wait.
 
 These rules make it rare for a guess to start a reply later than it would have started without Bell. Rare is not never.
+In a replay of 300 scripted calls to one bank (1,607 turns), the reply started later than without Bell on 2 turns.
 
 ## Options
 
 | Option | Default | |
 |---|---|---|
 | `agent` | `"default"` | Your agent's name: 1 to 64 lower-case letters, digits, `-` or `_`. Each agent learns from its own calls, and calls that share a name share what Bell learns: give each voice agent you run its own name and keep all of its calls under it. What Bell learns for it belongs to your account, so a new key keeps it. `"demo-bank"` is read-only. |
-| `min_chance` | `0.7` | How sure Bell must be before it guesses, from `0.67` to `0.99`. Higher sends fewer guesses, and fewer wrong ones. A value outside is clamped and one line is logged. |
+| `min_chance` | `None` | How sure Bell must be of a guess before it sends it, from `0.67` to `0.99`. Left at `None`, Bell uses its balanced setting. Set, every guess must also be at least that sure: fewer guesses, so fewer wrong ones (each costs your agent an extra call to its LLM) and fewer right ones. A value outside is clamped and one line is logged. |
 | `answer_timeout` | `0.5` | Seconds after its words within which a guess is still used. |
 | `learn` | `True` | `False` means the calls through this wrapper teach Bell nothing. |
 | `user` | `None` | An id you choose for the person on the call: 1 to 128 letters, digits, `.`, `_`, `:` or `-`. Bell does not use it yet. Never a name, a number or an address. |
@@ -112,9 +118,10 @@ These rules make it rare for a guess to start a reply later than it would have s
 | `http_session` | the job's own, else a new one | An `aiohttp.ClientSession` for the API's WebSocket. |
 
 All but the last three can be changed with `update_options()`. `answer_timeout` and `report` take effect at once and
-the others from the next speech stream. `user=None` stops sending the id. An `agent`, `user`, `learn` or `report` not
-of the form above, a `min_chance` that is not a number or an `answer_timeout` not over 0 raises `ValueError`. Bell is
-sent the caller's words only, never the agent's lines.
+the others from the next speech stream. `user=None` stops sending the id, and `min_chance=None` goes back to the
+balanced setting. An `agent`, `user`, `learn` or `report` not of the form above, a `min_chance` that is not a number
+or `None`, or an `answer_timeout` not over 0 raises `ValueError`. Bell is sent the caller's words only, never the
+agent's lines.
 
 ## Seeing Bell work
 
@@ -125,7 +132,8 @@ the call. LiveKit's own "using preemptive generation" line does not show Bell's 
 every early reply it keeps.
 
 The API's `GET /v1/agents/{agent}` shows the calls Bell has heard for your agent and, with `report` on,
-`guesses_kept`, `guesses_dropped`, the head start and the agent's state (`learning`, `guessing` or `quiet`). The plugin
+`guesses_kept`, `guesses_dropped`, the head start and the agent's state (`learning`, `guessing` or `quiet`). With this plugin, where Bell stands for your
+agent is under `v3`: `silent` until Bell has learned from enough of the agent's calls, then `guessing`. The plugin
 reports your speech-to-text's model and provider as its own, so LiveKit's metrics and logs name your speech-to-text.
 
 ## Limits
@@ -155,4 +163,4 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   API is ignored. A guess that comes late, under `min_chance` or after its turn has ended is dropped. With no API key, or
   `enabled=False`, no connection is opened. A conversation that closes cleanly after a minute or more (the API closes
   one after an hour) is reopened at once; any other is reopened as when the API is down. The tests run each of these
-  cases against a local stand-in for version 1 and version 2 of Rabel's API.
+  cases against a local stand-in for versions 1, 2 and 3 of Rabel's API.
