@@ -2316,3 +2316,162 @@ async def test_user_form_checked_and_not_repeated(bad):
         w.update_options(user=bad)
     assert w._hello()["user"] == "u-1"
     assert "user" not in rabel.STT(ScriptedSTT(TURN), api_key="test")._hello()
+
+
+# ------------------------------------------------------------------ the session's own settings (rule 6)
+
+
+def in_session(monkeypatch, session):
+    """The job's primary session, as `get_job_context` gives it to the wrapper inside a running job."""
+    import types
+
+    from livekit.plugins.rabel import stt as rabel_stt
+
+    monkeypatch.setattr(
+        rabel_stt,
+        "get_job_context",
+        lambda *, required=True: types.SimpleNamespace(primary_session=session),
+    )
+
+
+def session_with(**turn_handling):
+    from livekit.agents import AgentSession
+
+    return AgentSession(turn_handling=turn_handling)
+
+
+async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypatch):
+    import types
+
+    from livekit.agents import Agent
+    from livekit.plugins.rabel import stt as rabel_stt
+    from livekit.plugins.rabel.stt import _host_limits, _HostLimits
+
+    defaults = _HostLimits(early_replies=True, max_starts=3, max_speech_s=10.0)
+    # no job (these tests, a developer's own script): LiveKit's defaults
+    assert _host_limits() == defaults
+    in_session(monkeypatch, session_with())
+    assert _host_limits() == defaults
+
+    in_session(
+        monkeypatch,
+        session_with(preemptive_generation={"max_retries": 1, "max_speech_duration": 4}),
+    )
+    assert _host_limits() == _HostLimits(early_replies=True, max_starts=1, max_speech_s=4.0)
+
+    # where LiveKit starts no early reply: preemptive generation off, turns ended by hand, a realtime model
+    in_session(monkeypatch, session_with(preemptive_generation={"enabled": False}))
+    assert _host_limits().early_replies is False
+    in_session(monkeypatch, session_with(turn_detection="manual"))
+    assert _host_limits().early_replies is False
+    session = session_with()
+    not_an_llm = object()  # stands for a realtime model: anything that is not an llm.LLM
+    in_session(
+        monkeypatch,
+        types.SimpleNamespace(
+            options=session.options, turn_detection=None, llm=not_an_llm, current_agent=None
+        ),
+    )
+    assert _host_limits().early_replies is False
+
+    # the running agent's own settings come before the session's, as LiveKit resolves them
+    session = session_with(preemptive_generation={"max_retries": 2})
+    agent = Agent(
+        instructions="x",
+        turn_handling={"preemptive_generation": {"max_retries": 1}, "turn_detection": "manual"},
+    )
+    in_session(
+        monkeypatch,
+        types.SimpleNamespace(
+            options=session.options,
+            turn_detection=session.turn_detection,
+            llm=None,
+            current_agent=agent,
+        ),
+    )
+    assert _host_limits() == _HostLimits(early_replies=False, max_starts=1, max_speech_s=10.0)
+
+    # a job with no session started, or settings that cannot be read: LiveKit's defaults, never an error
+    class NoSession:
+        @property
+        def primary_session(self):
+            raise RuntimeError("No AgentSession was started for this job")
+
+    monkeypatch.setattr(rabel_stt, "get_job_context", lambda *, required=True: NoSession())
+    assert _host_limits() == defaults
+    in_session(monkeypatch, object())
+    assert _host_limits() == defaults
+
+
+@pytest.mark.parametrize(
+    "turn_handling",
+    [{"preemptive_generation": {"enabled": False}}, {"turn_detection": "manual"}],
+    ids=["early-replies-off", "turns-ended-by-hand"],
+)
+async def test_no_guess_where_livekit_starts_no_early_reply(turn_handling, monkeypatch):
+    # a guess would start nothing there; it would only stand in LiveKit's text in place of the caller's words, and a
+    # turn ended by hand (`session.commit_user_turn()`) would commit it as what the caller said
+    in_session(monkeypatch, session_with(**turn_handling))
+    api = FakeAPI(answers=GUESS_AT_CHECK, v=3)
+    out, counts = await wrapped_run(TURN, api)
+    assert out == await plain_run(TURN)
+    assert counts["guess_no_early_reply"] == 1 and "guess_sent" not in counts
+    # Bell still hears the turn, and the report says no guess was passed on
+    assert [m["type"] for m in api.received].count("heard") == 4
+    assert api.received[-1] == {
+        "type": "end_of_turn",
+        "text": "I'd like to check my balance.",
+        "guess": "none",
+    }
+
+
+async def test_with_one_early_start_a_turn_bell_sends_no_guess(monkeypatch):
+    # `max_retries` 1: a guess would take the turn's only early start; were it wrong, LiveKit could start none on the
+    # final words, and the reply would start later than without Bell
+    in_session(monkeypatch, session_with(preemptive_generation={"max_retries": 1}))
+    out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    assert out == await plain_run(TURN)
+    assert counts["guess_third_start"] == 1 and "guess_sent" not in counts
+
+
+async def test_with_two_early_starts_a_turn_bell_takes_only_the_first(monkeypatch):
+    in_session(monkeypatch, session_with(preemptive_generation={"max_retries": 2}))
+    out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.") in out
+    assert counts["guess_sent"] == 1
+    # after the speech-to-text's own early start one is left, and it is not Bell's
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.PREFLIGHT_TRANSCRIPT, "I'd like", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.90, T.FINAL_TRANSCRIPT, "I'd like to check my balance."),
+        ev(0.90, T.END_OF_SPEECH),
+    ]
+    out, counts = await wrapped_run(script, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    assert out == await plain_run(script)
+    assert counts["guess_third_start"] == 1 and "guess_sent" not in counts
+
+
+async def test_no_guess_after_the_sessions_limit_of_speech(monkeypatch):
+    in_session(monkeypatch, session_with(preemptive_generation={"max_speech_duration": 0.2}))
+    out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    assert out == await plain_run(TURN)
+    assert counts["guess_past_10s"] == 1 and "guess_sent" not in counts
+
+
+async def test_a_started_session_is_read_through_its_job():
+    # no stand-in for LiveKit here: a real session, started inside a job as LiveKit's own test helper makes one
+    from livekit.agents import Agent, AgentSession
+    from livekit.agents.testing import fake_job_context
+    from livekit.plugins.rabel.stt import _host_limits, _HostLimits
+
+    with fake_job_context():
+        session = AgentSession(turn_handling={"preemptive_generation": {"max_retries": 1}})
+        await session.start(Agent(instructions="x", turn_handling={"turn_detection": "manual"}))
+        try:
+            assert _host_limits() == _HostLimits(
+                early_replies=False, max_starts=1, max_speech_s=10.0
+            )
+        finally:
+            await session.aclose()
+    assert _host_limits() == _HostLimits()

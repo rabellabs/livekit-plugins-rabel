@@ -36,9 +36,15 @@ The rules, applied to the inner speech-to-text's events while a guess of Bell's 
   4. Any other interim that disagrees is passed, which cancels the wrong guess.
   5. An early start (preflight) of the inner speech-to-text whose words equal the guess is held back; one with other
      words is passed and replaces the guess.
-  6. Nothing is sent past LiveKit's default limits for preemptive generation (`max_retries` 3, `max_speech_duration`
-     10 s): one guess alive at a time (one guess a turn with an API that answers a version 1 or 2 `ready`), never as the
-     third early start of a turn, none after 10 seconds of speech, never a guess equal to the running early start. Nor is a guess sent once the speech-to-text has
+  6. Nothing is sent past the session's limits for preemptive generation (`max_retries`, 3 by default, and
+     `max_speech_duration`, 10 s by default; the session's own values are read, the agent's over the session's, and
+     LiveKit's defaults are used when there is no job to read them from): one guess alive at a time (one guess a turn
+     with an API that answers a version 1 or 2 `ready`), never as the last early start the session allows in a turn (the
+     third by default; with `max_retries` 1 Bell sends none), none after the limit of speech, never a guess equal to the
+     running early start. No guess is sent where LiveKit starts no early reply at all: preemptive generation switched
+     off, turns ended by hand (`turn_detection="manual"`), or a realtime model in place of the LLM. There a guess would
+     start nothing and would only replace the caller's words in LiveKit's text. Nor is a guess sent once the
+     speech-to-text has
      made its own early start in the turn (Deepgram Flux's eager end of turn): while that start runs, a guess would
      cancel it, and if the caller stops on its words LiveKit keeps no early reply (with `turn_detection="stt"` it starts
      none at the final); after it, the guess would leave the speech-to-text one start, and when its next early start
@@ -102,7 +108,14 @@ from typing import TYPE_CHECKING, Any, cast
 import aiohttp
 
 from livekit import rtc
-from livekit.agents import LanguageCode, __version__ as _livekit_version, stt, utils
+from livekit.agents import (
+    LanguageCode,
+    __version__ as _livekit_version,
+    get_job_context,
+    llm,
+    stt,
+    utils,
+)
 from livekit.agents.tokenize.basic import split_words
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
@@ -121,7 +134,8 @@ if TYPE_CHECKING:
 
 DEFAULT_BASE_URL = "https://api.rabellabs.com"
 # LiveKit's preemptive generation defaults (voice/turn.py, PreemptiveGenerationOptions): at most 3 early starts a turn
-# (`max_retries`), none after 10 s of speech (`max_speech_duration`). The hookup assumes these defaults.
+# (`max_retries`), none after 10 s of speech (`max_speech_duration`). The session's own values are read where they can be
+# (`_host_limits`); these are used when they cannot.
 MAX_EARLY_STARTS = 3
 MAX_SPEECH_S = 10.0
 # rule 3: a speech-to-text may change a word it has shown; a last word under this confidence is taken as unsure.
@@ -247,6 +261,78 @@ def _tail_only(w: Words, g: Words) -> bool:
     """w differs from g only in its last word, and is not longer than g."""
     n = len(w)
     return 1 <= n <= len(g) and w[:-1] == g[: n - 1] and w[-1] != g[n - 1]
+
+
+@dataclasses.dataclass(frozen=True)
+class _HostLimits:
+    """What LiveKit does with an early start in the session this speech-to-text serves."""
+
+    # LiveKit starts an early reply on an early start at all: preemptive generation is on, turns are not ended by hand
+    # (`turn_detection="manual"`), and the reply comes from an LLM (not a realtime model)
+    early_replies: bool = True
+    max_starts: int = MAX_EARLY_STARTS  # `max_retries`: early starts LiveKit makes in one turn
+    max_speech_s: float = MAX_SPEECH_S  # `max_speech_duration`: none after this much speech
+
+
+_DEFAULT_LIMITS = _HostLimits()
+
+
+def _host_limits() -> _HostLimits:
+    """The session's settings, as LiveKit resolves them for the running agent (agent_activity: the agent's own
+    `turn_handling`, turn detection and LLM override the session's). Read from the job's primary session each time, so
+    a change or a handoff to another agent is followed. LiveKit's defaults when there is no job or no session, and for
+    any value that cannot be read."""
+    try:
+        ctx = get_job_context(required=False)
+        if ctx is None:
+            return _DEFAULT_LIMITS
+        session = ctx.primary_session
+    except Exception:  # noqa: BLE001 -- no session started for this job
+        return _DEFAULT_LIMITS
+    try:
+        try:
+            agent = session.current_agent
+        except RuntimeError:  # the session is not running an agent yet
+            agent = None
+        opts: dict[str, Any] = dict(session.options.preemptive_generation)
+        agent_opts = getattr(agent, "_turn_handling", None)
+        agent_opts = (
+            agent_opts.get("preemptive_generation") if isinstance(agent_opts, dict) else None
+        )
+        if isinstance(agent_opts, dict):
+            opts.update(agent_opts)
+        elif isinstance(agent_opts, bool):
+            opts["enabled"] = agent_opts
+
+        turn_detection = session.turn_detection
+        reply_model = session.llm
+        if agent is not None:
+            if utils.is_given(agent.turn_detection):
+                turn_detection = agent.turn_detection
+            if utils.is_given(agent.llm):
+                reply_model = agent.llm
+
+        enabled = opts.get("enabled", True)
+        max_starts = opts.get("max_retries", MAX_EARLY_STARTS)
+        max_speech_s = opts.get("max_speech_duration", MAX_SPEECH_S)
+        if isinstance(max_starts, bool) or not isinstance(max_starts, int) or max_starts < 0:
+            max_starts = MAX_EARLY_STARTS
+        if isinstance(max_speech_s, bool) or not isinstance(max_speech_s, (int, float)):
+            max_speech_s = MAX_SPEECH_S
+        return _HostLimits(
+            early_replies=(
+                enabled is not False
+                and turn_detection != "manual"
+                and (reply_model is None or isinstance(reply_model, llm.LLM))
+            ),
+            max_starts=max_starts,
+            max_speech_s=float(max_speech_s),
+        )
+    except Exception as e:  # noqa: BLE001 -- a setting that cannot be read never touches the speech-to-text's events
+        logger.debug(
+            f"Bell: the session's settings could not be read ({e!r}); LiveKit's defaults are used"
+        )
+        return _DEFAULT_LIMITS
 
 
 class STT(stt.STT):
@@ -682,7 +768,8 @@ class SpeechStream(stt.RecognizeStream):
                 self._count("eager_held_back")
                 t.held = None
                 return []
-            if t.bell_sent and t.running is not None and t.starts >= MAX_EARLY_STARTS:
+            lim = _host_limits()
+            if t.bell_sent and t.running is not None and t.starts >= lim.max_starts:
                 # rule 9: no early start is left (Bell's guess took one); LiveKit would cancel the running reply and start
                 # none, so the reply under way is left to run
                 self._count("eager_held_no_start_left")
@@ -690,7 +777,11 @@ class SpeechStream(stt.RecognizeStream):
             # passed: LiveKit cancels the running early start, then starts on these words if within its limits
             t.live, t.held = None, None
             t.waiting_guess = None
-            if t.starts < MAX_EARLY_STARTS and time.time() - t.speech_start <= MAX_SPEECH_S:
+            if (
+                lim.early_replies
+                and t.starts < lim.max_starts
+                and time.time() - t.speech_start <= lim.max_speech_s
+            ):
                 t.starts += 1
                 t.stt_starts += 1
                 t.running = w
@@ -965,6 +1056,13 @@ class SpeechStream(stt.RecognizeStream):
         if t is None or self._broken or not self._turn_open(t):
             self._count("guess_no_turn")  # the turn it answers is over
             return None
+        lim = _host_limits()
+        if not lim.early_replies:
+            # rule 6: LiveKit starts no early reply in this session (preemptive generation off, turns ended by hand, or
+            # a realtime model in place of the LLM). A guess would start nothing; it would only stand in LiveKit's text
+            # in place of the caller's words, and a turn ended by hand would commit it as what the caller said.
+            self._count("guess_no_early_reply")
+            return None
         g = words_of(text)
         h = words_of(heard)
         if not g:
@@ -1015,7 +1113,9 @@ class SpeechStream(stt.RecognizeStream):
         if t.running is not None and g == t.running:
             self._count("guess_same_as_running")
             return None
-        if t.starts >= MAX_EARLY_STARTS - 1:
+        if t.starts >= lim.max_starts - 1:
+            # the last early start the session allows in a turn is left for the speech-to-text's own and for
+            # LiveKit's at the final (the third, at LiveKit's default)
             self._count("guess_third_start")
             return None
         if t.stt_starts >= 1:
@@ -1023,7 +1123,7 @@ class SpeechStream(stt.RecognizeStream):
             # or leave the speech-to-text one start for the rest of the turn
             self._count("guess_after_stt_start")
             return None
-        if time.time() - t.speech_start > MAX_SPEECH_S:
+        if time.time() - t.speech_start > lim.max_speech_s:
             self._count("guess_past_10s")
             return None
         committed = words_of(" ".join(t.committed))

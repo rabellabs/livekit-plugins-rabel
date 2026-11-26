@@ -85,8 +85,12 @@ preemptive generation is on and Flux's eager end of turn is off. That is
 - One guess at a time is your agent's early reply. When the caller's words go another way, the reply started on that
   guess is dropped, and Bell may send a new guess in the same turn. A guess can also be the words heard so far: Bell's
   guess that the caller has finished.
-- The plugin keeps within LiveKit's default limits for preemptive generation (`max_retries` 3, `max_speech_duration`
-  10 s): a guess is never the third early start of a turn and is never sent after 10 seconds of speech.
+- The plugin keeps within your session's limits for preemptive generation (`max_retries`, 3 by default, and
+  `max_speech_duration`, 10 s by default). It reads them from the session, and from the running agent where the agent
+  sets its own. A guess is never the last early start the session allows in a turn, and is never sent after the limit
+  of speech.
+- Where LiveKit starts no early reply at all, Bell sends no guess: with preemptive generation off, with
+  `turn_detection="manual"`, or with a realtime model in place of the LLM.
 - **With Flux's eager end of turn on**, Bell sends no guess once your speech-to-text has made its own early start in the
   turn, because the guess would cancel that start's reply or take a start the speech-to-text needs next. On a turn where
   Bell's guess took one of LiveKit's early starts, the speech-to-text's own early start is held back when none is left
@@ -143,8 +147,10 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   measured, and the numbers were not read with Flux's eager end of turn on.
 - **A later reply is rare, not impossible.** On some turns a guess can still start the reply later than it would have
   started without Bell.
-- **Keep LiveKit's default preemptive-generation limits.** The plugin assumes them. With lower limits set in
-  `preemptive_generation`, a guess can take the place of an early reply that LiveKit then has no try left to replace.
+- **Lower preemptive-generation limits mean fewer guesses.** The plugin never takes the last early start of a turn, so
+  LiveKit always has one left for the caller's real words. With `max_retries` 2, Bell's guess can only be a turn's
+  first early start. With `max_retries` 1, Bell sends none. Outside a LiveKit job (a script that drives the
+  speech-to-text by itself) the plugin cannot read the session and assumes LiveKit's defaults.
 - **Keep LiveKit's minimum interruption words at its default 0.** Set above 0 (`min_words` in `turn_handling`'s
   interruption options, `min_interruption_words` before), LiveKit counts a guess's words as the caller's. A "yeah" while
   your agent speaks can bring a guess long enough to interrupt or pause it.
@@ -152,9 +158,12 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
 - **While a guess is live, your live caption shows the guess.** The user transcript LiveKit shows and sends to your
   front end carries Bell's guess, not the caller's words so far, until the words move past it or the final arrives. A
   front end cannot tell the two apart. Only `enabled=False` turns this off.
-- **An app that commits turns itself should set `enabled=False`.** LiveKit starts no early reply on turns committed by
-  hand (`session.commit_user_turn()`, push-to-talk, `turn_detection="manual"`), so Bell gives it nothing. And a commit,
-  or the session closing, within half a second of a guess commits the guess as the caller's words.
+- **Turns ended by hand.** With `turn_detection="manual"` (push-to-talk) LiveKit starts no early reply, so Bell sends
+  no guess and your speech-to-text's events pass unchanged. One case is left: an app that keeps turn detection
+  automatic and also calls `session.commit_user_turn()` itself. When an early start arrived in the last half second,
+  LiveKit does not wait for the final transcript and commits the text it holds, which is then Bell's guess. The same
+  holds when the session closes within half a second of a guess. An app that ends turns by hand under automatic turn
+  detection should set `enabled=False`.
 - **It fails open.** If the API is slow, down, refuses or errors, the events are exactly your speech-to-text's, nothing
   is raised into the agent, and at most one line is logged for each kind of failure. With nothing listening, or no
   ready within 2 s of opening, it retries after 1, 2, 4, 8 and 16 s, then every 30 s. A 429 `key_at_once` or 529
