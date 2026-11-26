@@ -73,7 +73,9 @@ generation is on by default in LiveKit, and Bell needs it on.
 The snippet is the setup Rabel's numbers were measured in: LiveKit's own turn detection ends the turn (its VAD and turn
 detector, the default), preemptive generation is on and Flux's eager end of turn is off. There LiveKit keeps an early
 reply only when the final transcript is the same string as the guess, so the plugin writes the guess the way your
-speech-to-text writes its finals.
+speech-to-text writes its finals. For English it uses the usual English forms. For any other language it copies how
+this call's own final transcripts have been written so far: each word as your speech-to-text wrote it, and the turn
+closed the way the call's turns have closed. It assumes nothing about the language.
 
 Bell also works with `turn_detection="stt"`, where your speech-to-text ends the turn. With Flux's eager end of turn on
 (`eager_eot_threshold`), Bell sends no guess once Flux has made its own early start in a turn, and Rabel's numbers were
@@ -149,6 +151,12 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
 - **The numbers come from one kind of call:** scripted calls to one bank, in English, with Flux's words. On freer speech we
   have only looked informally, and Bell mostly stayed quiet. No live deployment's callers and no other language have been
   measured, and the numbers were not read with Flux's eager end of turn on.
+- **Other languages are not measured on calls.** Bell learns from the words your speech-to-text sends, in any language.
+  In a text reading of the same dialogues in English, Hindi, mixed English-Hindi and French, it guessed at least as well
+  in the other three as in English. What differs is the writing of a guess: in a language other than English the
+  plugin has nothing to copy until the call's first final transcript, so under LiveKit's own turn detection a right
+  guess in a call's first turn is usually not kept, and later turns depend on how evenly your speech-to-text writes.
+  With `turn_detection="stt"`, LiveKit compares words and the writing does not matter.
 - **A later reply is rare, not impossible.** On some turns a guess can still start the reply later than it would have
   started without Bell.
 - **Lower preemptive-generation limits mean fewer guesses.** The plugin never takes the last early start of a turn, so

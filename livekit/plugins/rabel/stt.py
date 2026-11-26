@@ -126,7 +126,7 @@ from livekit.agents.types import (
 )
 
 from ._bell import BellConnection
-from ._form import final_form
+from ._form import CallForm, final_form, written
 from .log import logger
 from .version import __version__
 
@@ -585,6 +585,8 @@ class SpeechStream(stt.RecognizeStream):
         self._lk_has_text = False
         # rule 8: LiveKit's own early reply made on a final is waiting for LiveKit's commit
         self._lk_waiting = False
+        # how this call's speech-to-text has written its final transcripts, for a guess in a language other than English
+        self._form = CallForm()
         # what this stream's guesses did for the host, for the summary logged when it closes (numbers only)
         self.summary: dict[str, int] = {
             "turns": 0,
@@ -715,6 +717,10 @@ class SpeechStream(stt.RecognizeStream):
         t.last_alt = alt
 
         if ev.type == T.FINAL_TRANSCRIPT:
+            try:
+                self._form.final(text)
+            except Exception:  # noqa: BLE001 -- the form is read only for another language's guess
+                self._count("form_not_learned")
             t.committed.append(text)
             t.words = words_of(" ".join(t.committed))
             t.shown = ""
@@ -1154,7 +1160,12 @@ class SpeechStream(stt.RecognizeStream):
         # formed after them (LiveKit's default turn detection keeps an early reply only when the final is the same string)
         shown_words = words_of(t.shown)
         if t.words == committed + shown_words and _is_begin(t.words, g):
-            text = final_form(t.shown, g[len(t.words) :])
+            added = g[len(t.words) :]
+            if _english(t.last_alt):
+                text = final_form(t.shown, added)
+            else:
+                # another language: no rule of English, the guess is written as this call's finals have been
+                text = written(t.shown, added, self._form)
         elif committed:
             text = " ".join(g[len(committed) :])
         if v3 and not text.strip():
@@ -1186,6 +1197,14 @@ class SpeechStream(stt.RecognizeStream):
             extra={"chance": chance, "words_so_far": len(t.words)},
         )
         return stt.SpeechEvent(type=stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, alternatives=[sd])
+
+
+def _english(alt: stt.SpeechData | None) -> bool:
+    """The speech-to-text says the words are English, or does not say one language (none given, "multi"): the guess is
+    then written by the English rules, as it always was."""
+    lang = getattr(alt, "language", None)
+    base = str(getattr(lang, "language", lang) or "").lower()
+    return base in ("", "en", "multi", "und")
 
 
 def _unit(v: Any) -> float | None:

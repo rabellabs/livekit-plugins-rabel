@@ -31,9 +31,10 @@ T = stt.SpeechEventType
 class ScriptedSTT(stt.STT):
     """Emits (seconds after the first audio frame, event type, text, last word's confidence) in order."""
 
-    def __init__(self, script):
+    def __init__(self, script, language="en"):
         super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
         self.script = script
+        self.language = language
 
     @property
     def provider(self) -> str:
@@ -69,7 +70,10 @@ class ScriptedStream(stt.RecognizeStream):
                     words[-1] = TimedString(str(words[-1]), confidence=conf)
                 alts = [
                     stt.SpeechData(
-                        language=LanguageCode("en"), text=text, words=words, confidence=0.9
+                        language=LanguageCode(getattr(self._stt, "language", "en")),
+                        text=text,
+                        words=words,
+                        confidence=0.9,
                     )
                 ]
             self._event_ch.send_nowait(stt.SpeechEvent(type=typ, alternatives=alts))
@@ -2506,3 +2510,79 @@ async def test_no_guess_while_the_agents_reply_is_under_way(interrupted, sent, m
     else:
         assert out == await plain_run(TURN)
         assert counts["guess_while_agent_speaks"] == 1 and "guess_sent" not in counts
+
+
+async def run_in(language, script, api):
+    """wrapped_run with a speech-to-text that says its words are in `language`"""
+    runner, url = await serve(api)
+    try:
+        async with aiohttp.ClientSession() as http:
+            w = rabel.STT(
+                ScriptedSTT(script, language=language),
+                api_key="test",
+                base_url=url,
+                http_session=http,
+            )
+            out = await collect(w, wait_ready=w)
+            ends = [m for m in api.received if m["type"] == "end_of_turn"]
+            return out, ends
+    finally:
+        await runner.cleanup()
+
+
+# ------------------------------------------------------------------ a language other than English
+#
+# Under LiveKit's default turn detection an early reply is kept only when the final transcript is the same string as the
+# early start's, so the guess is written the way the final will be. For English that is `final_form`'s rules. For any
+# other language it is the call's own form: how this call's final transcripts have been written so far.
+
+FIRST_HI = "\u092e\u0947\u0930\u093e \u0928\u093e\u092e \u0930\u093e\u092e \u0939\u0948\u0964"
+HEARD_HI = "\u092e\u0941\u091d\u0947 \u0905\u092a\u0928\u093e \u092c\u0948\u0932\u0947\u0902\u0938"
+REST_HI = "\u091a\u0947\u0915 \u0915\u0930\u0928\u093e \u0939\u0948"
+SAID_HI = HEARD_HI + " " + REST_HI + "\u0964"  # the turn as the speech-to-text writes it, closed with Hindi's own mark
+HINDI = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, FIRST_HI[:8], 0.95),
+    ev(0.30, T.FINAL_TRANSCRIPT, FIRST_HI),
+    ev(0.30, T.END_OF_SPEECH),
+    ev(0.45, COMMIT, FIRST_HI),
+    ev(0.60, T.START_OF_SPEECH),
+    ev(0.65, T.INTERIM_TRANSCRIPT, HEARD_HI, 0.95),
+    ev(1.10, T.FINAL_TRANSCRIPT, SAID_HI),
+    ev(1.10, T.END_OF_SPEECH),
+]
+
+
+@pytest.mark.parametrize("language, kept", [("hi", True), ("en", False), ("multi", False)])
+async def test_another_language_is_written_as_the_calls_own_finals_were(language, kept):
+    api = FakeAPI(answers={HEARD_HI: HEARD_HI + " " + REST_HI}, v=3)
+    out, ends = await run_in(language, HINDI, api)
+    guess = [text for typ, text in out if typ == T.PREFLIGHT_TRANSCRIPT]
+    if kept:
+        # the call's first final closed with Hindi's own mark, so the guess does, and it is the final's string
+        assert guess == [SAID_HI] and ends[-1]["guess"] == "kept"
+    else:
+        # English, or a speech-to-text that names no one language: the English rules, as before
+        assert guess == [HEARD_HI + " " + REST_HI + "."] and ends[-1]["guess"] == "dropped"
+
+
+def test_the_calls_own_form():
+    from livekit.plugins.rabel._form import CallForm, final_form, written
+
+    form = CallForm()
+    # before any final transcript there is nothing to copy: the guess is written as `final_form` writes it
+    assert written("Je voudrais", ("un", "billet"), form) == final_form("Je voudrais", ("un", "billet"))
+    form.final("Je voudrais v\u00e9rifier mon solde.")
+    form.final("Pouvez-vous l'emmener \u00e0 l'h\u00f4tel ?")
+    # a word as this call wrote it (its apostrophe back), and the turn closed as it closed after the same opening word
+    assert written("Pouvez-vous", ("lemmener",), form) == "Pouvez-vous l'emmener ?"
+    assert written("Je voudrais", ("un", "billet"), form) == "Je voudrais un billet."
+    # an opening word not heard yet: the way most of the call's turns have closed
+    form.final("Combien co\u00fbte le billet ?")
+    assert written("Quel est", ("le", "prix"), form) == "Quel est le prix ?"
+    # a guess that adds nothing (the end bet) is the speech-to-text's own text
+    assert written("Je voudrais un billet", (), form) == "Je voudrais un billet"
+    # a speech-to-text that writes no capitals and no marks is copied as it is
+    plain = CallForm()
+    plain.final("mera naam ram hai")
+    assert written("", ("mujhe", "balance"), plain) == "mujhe balance"
