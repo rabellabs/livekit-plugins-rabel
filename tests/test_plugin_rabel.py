@@ -119,9 +119,10 @@ class FakeAPI:
     API's own values.
     mode: "ok" (guess `answers[heard words]` after `delay` s), "refuse" (an error message at once), "garbage" (answers
     with broken JSON, a guess for words never sent and a bad_message). `plan` gives a mode for each conversation in
-    turn, the last repeating. `ready_after` delays the ready; `close_after` closes a conversation cleanly that long
-    after its ready. `ready_extra` adds fields to a version 2 or 3 `ready` (a version 2 `ready` with rule 3's
-    `hold_always` and `hold_updates`: fields this client takes from a version 3 `ready` only).
+    turn, the last repeating. "half-open" sends the ready, then answers nothing (no pong, no guess) and keeps no word
+    it is sent, as a connection that died without a close. `ready_after` delays the ready; `close_after` closes a
+    conversation cleanly that long after its ready. `ready_extra` adds fields to a version 2 or 3 `ready` (a version 2
+    `ready` with rule 3's `hold_always` and `hold_updates`: fields this client takes from a version 3 `ready` only).
     `refuse_report` answers an `end_of_turn` that carries the report with 400 bad_message and closes."""
 
     def __init__(
@@ -195,10 +196,10 @@ class FakeAPI:
         return g
 
     async def conversation(self, req):
-        ws = web.WebSocketResponse()
+        mode = self.plan[min(len(self.connected_at) + 1, len(self.plan)) - 1]
+        ws = web.WebSocketResponse(autoping=mode != "half-open")
         await ws.prepare(req)
         self.connected_at.append(time.monotonic())
-        mode = self.plan[min(len(self.connected_at), len(self.plan)) - 1]
         self.hello = json.loads((await ws.receive()).data)
         if mode == "refuse":
             await ws.send_str(
@@ -217,6 +218,15 @@ class FakeAPI:
         if self.ready_after:
             await asyncio.sleep(self.ready_after)
         await ws.send_str(json.dumps(self.ready()))
+        if mode == "half-open":
+            while (await ws.receive()).type not in (
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.ERROR,
+            ):
+                pass  # the client's words and pings go nowhere
+            return ws
         if self.close_after is not None:
             asyncio.get_running_loop().call_later(
                 self.close_after, lambda: asyncio.ensure_future(ws.close())
@@ -604,6 +614,33 @@ async def test_clean_close_reopens_at_once_only_after_a_long_conversation(
     api = FakeAPI(v=2, close_after=0.4)
     at = await _reopen_run(api)
     assert len(at) >= 2 and reopen_at[0] <= at[1] <= reopen_at[1], at
+
+
+LATE_TURN = [(at + 2.0, *rest) for at, *rest in TURN]  # a turn after 2 s of a quiet line
+
+
+async def test_a_dead_connection_after_ready_is_noticed_and_reopened(monkeypatch, caplog):
+    import livekit.plugins.rabel._bell as bell
+
+    monkeypatch.setattr(bell, "_LIVENESS_TIMEOUT_S", 0.3)  # a ping after 0.1 s of quiet
+    caplog.set_level(logging.WARNING, logger="livekit.plugins.rabel")
+    # a healthy line that stays quiet for 2 s answers the pings, stays open and guesses
+    api = FakeAPI(answers=GUESS_AT_CHECK, v=2)
+    late, _ = await wrapped_run(LATE_TURN, api)
+    assert late != await plain_run(LATE_TURN) and len(api.connected_at) == 1
+    assert not _rabel_lines(caplog)
+    # a half-open one: the first turn (committed) passes through unchanged; no pong within the liveness timeout gives
+    # one "down" line, and the back-off's first wait (1 s) later a new conversation guesses the late turn as the
+    # healthy line did
+    api = FakeAPI(plan=["half-open", "ok"], answers=GUESS_AT_CHECK, v=2)
+    first = [*TURN, ev(1.20, COMMIT, "I'd like to check my balance.")]
+    out, _ = await wrapped_run([*first, *LATE_TURN], api)
+    at = [t - api.connected_at[0] for t in api.connected_at]
+    assert len(at) == 2 and 1.2 <= at[1] <= 1.8, at
+    assert [m["text"] for m in api.received if m["type"] == "end_of_turn"] == ["I'd like to check my balance."]
+    assert out == await plain_run(TURN) + late
+    lines = _rabel_lines(caplog)
+    assert len(lines) == 1 and "APIConnectionError" in lines[0], lines
 
 
 async def test_contradicting_interim_passes_and_eager_replaces():
