@@ -282,6 +282,9 @@ class _HostLimits:
     # the agent has a reply under way that the caller has not interrupted: LiveKit starts no early reply until it is
     # interrupted or done (agent_activity's on_preemptive_generation)
     agent_speaking: bool = False
+    # turns are ended by the speech-to-text (`turn_detection="stt"`): LiveKit starts an early reply on a final only
+    # after the speech-to-text's end of speech (audio_recognition: `_stt_turn_ended`), not on a final within the turn
+    stt_turns: bool = False
 
 
 _DEFAULT_LIMITS = _HostLimits()
@@ -340,6 +343,7 @@ def _host_limits() -> _HostLimits:
             agent_speaking=(
                 (speech := session.current_speech) is not None and not speech.interrupted
             ),
+            stt_turns=turn_detection == "stt",
         )
     except Exception as e:  # noqa: BLE001 -- a setting that cannot be read never touches the speech-to-text's events
         logger.debug(
@@ -564,6 +568,9 @@ class _Turn:
     final_kept: bool = False
     head_start_ms: int | None = None
     kept_committed: bool = False
+    # the speech-to-text ended speech with words shown but not finalized: its final comes after its end of speech
+    # (OpenAI's realtime models with local VAD), and the turn ends at that final
+    speech_ended: bool = False
 
 
 class SpeechStream(stt.RecognizeStream):
@@ -595,6 +602,8 @@ class SpeechStream(stt.RecognizeStream):
         # `_preemptive_generation_count`, reset only when a turn is completed): a turn of the speech-to-text's can end and
         # another begin before LiveKit commits, and LiveKit's count runs on over both
         self._lk_starts = 0
+        # LiveKit's `_stt_turn_ended`: the speech-to-text has ended speech since it last started it
+        self._lk_stt_ended = False
         # how this call's speech-to-text has written its final transcripts, for a guess in a language other than English
         self._form = CallForm()
         # what this stream's guesses did for the host, for the summary logged when it closes (numbers only)
@@ -619,6 +628,16 @@ class SpeechStream(stt.RecognizeStream):
         self._timeline_start = time.time() - value
         if self._inner is not None:
             self._hand_on_offset(self._inner)
+
+    @property
+    def manual_flush(self) -> bool:
+        # the wrapped stream's need: LiveKit flushes this stream only when it says so, and the flush is passed on to the
+        # wrapped one. A FallbackAdapter's stream reports its live provider's need, which its STT's capability (every
+        # provider's) can hide. A livekit-agents without a stream-level need (1.8) reads the STT's capability.
+        caps = getattr(self._rstt._stt.capabilities, "manual_flush", False)
+        if self._inner is not None:
+            return bool(getattr(self._inner, "manual_flush", caps))
+        return caps
 
     def _hand_on_offset(self, inner: stt.RecognizeStream) -> None:
         if self._timeline_start is None:
@@ -708,11 +727,16 @@ class SpeechStream(stt.RecognizeStream):
     def _apply(self, ev: stt.SpeechEvent) -> list[stt.SpeechEvent]:
         T = stt.SpeechEventType
         if ev.type == T.START_OF_SPEECH:
+            self._lk_stt_ended = False
             self._end_turn()
             self._turn = self._new_turn(ev.speech_start_time or time.time())
             return [ev]
         if ev.type == T.END_OF_SPEECH:
-            self._end_turn()
+            self._lk_stt_ended = True
+            if self._turn is not None and self._turn.shown:
+                self._turn.speech_ended = True
+            else:
+                self._end_turn()
             return [ev]
         if ev.type not in (T.INTERIM_TRANSCRIPT, T.PREFLIGHT_TRANSCRIPT, T.FINAL_TRANSCRIPT):
             return [ev]
@@ -755,8 +779,12 @@ class SpeechStream(stt.RecognizeStream):
             t.final_kept = t.live is not None and t.words == t.live and lk_unchanged
             if t.final_kept and t.sent_at is not None:
                 t.head_start_ms = _ms(t.final_at - t.sent_at)
+            lim = _host_limits()
+            # LiveKit may start an early reply on a final: at any final with VAD or turn-detector endpointing, only
+            # after the speech-to-text's end of speech with its endpointing
+            on_final = not lim.stt_turns or self._lk_stt_ended
             out = [ev]
-            if self._lk_pre_stale and pre is not None and text.strip() == pre.strip():
+            if on_final and self._lk_pre_stale and pre is not None and text.strip() == pre.strip():
                 # rule 7: LiveKit still remembers the cancelled guess's text, finds this final unchanged and would start
                 # no early reply on it; the final goes first as the early start on its own words, as LiveKit makes it
                 self._count("final_sent_as_early_start")
@@ -771,9 +799,8 @@ class SpeechStream(stt.RecognizeStream):
                 changed = True
             else:
                 # LiveKit starts its own early reply on a final that changes its text (audio_recognition: transcript_changed)
-                changed = pre is None or text.strip() != pre.strip()
+                changed = on_final and (pre is None or text.strip() != pre.strip())
             if changed:
-                lim = _host_limits()
                 if (
                     lim.early_replies
                     and not lim.agent_speaking
@@ -788,6 +815,8 @@ class SpeechStream(stt.RecognizeStream):
                 # the running early start (Bell's guess, or the speech-to-text's own) whose words this final equals,
                 # which LiveKit keeps
                 self._lk_waiting = True
+            if t.speech_ended:
+                self._end_turn()  # the final that came after the end of speech
             return out
 
         w = words_of(" ".join([*t.committed, text]))
@@ -955,7 +984,9 @@ class SpeechStream(stt.RecognizeStream):
             self.summary["head_start_ms"] += head_start_ms or 0
             # in the form and at the level of LiveKit's own "using preemptive generation" line (agent_activity, 1.8.13)
             logger.debug("Bell's guess kept", extra={"head_start_ms": head_start_ms})
-        if t.sent_heard and self._bell is not None and self._turn_open(t):
+        # a turn with only finals (a speech-to-text that sends no interims) is sent too: the API takes an end_of_turn
+        # with no heard before it, and learns from the final words
+        if (t.sent_heard or t.committed) and self._bell is not None and self._turn_open(t):
             text = " ".join(t.committed) if t.committed else " ".join(t.words)
             if self._rstt._report:
                 self._bell.end_of_turn(
@@ -1090,7 +1121,7 @@ class SpeechStream(stt.RecognizeStream):
             )
             return None
         t = self._turn
-        if t is None or self._broken or not self._turn_open(t):
+        if t is None or t.speech_ended or self._broken or not self._turn_open(t):
             self._count("guess_no_turn")  # the turn it answers is over
             return None
         lim = _host_limits()

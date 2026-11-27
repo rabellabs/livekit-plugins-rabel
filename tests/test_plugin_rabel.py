@@ -2382,6 +2382,9 @@ async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypa
     assert _host_limits().early_replies is False
     in_session(monkeypatch, session_with(turn_detection="manual"))
     assert _host_limits().early_replies is False
+    # turns ended by the speech-to-text
+    in_session(monkeypatch, session_with(turn_detection="stt"))
+    assert _host_limits().stt_turns is True and _host_limits().early_replies is True
     session = session_with()
     not_an_llm = object()  # stands for a realtime model: anything that is not an llm.LLM
     in_session(
@@ -2643,3 +2646,145 @@ def test_the_calls_own_form():
     plain = CallForm()
     plain.final("mera naam ram hai")
     assert written("", ("mujhe", "balance"), plain) == "mujhe balance"
+
+
+def test_a_script_without_spaces_gets_none_between_the_added_words():
+    from livekit.plugins.rabel._form import CallForm, written
+
+    # LiveKit's comparison takes kana and ideographs one character at a time, so Bell's added words are single
+    # characters; they are written as the call's finals are, with no space between
+    ja = CallForm()
+    ja.final("\u6b8b\u9ad8\u3092\u78ba\u8a8d\u3057\u305f\u3044\u3067\u3059\u3002")
+    # the shown words and the added ones: the final's string exactly
+    said = "\u6b8b\u9ad8\u3092\u78ba\u8a8d\u3002"
+    assert written("\u6b8b\u9ad8", ("\u3092", "\u78ba", "\u8a8d"), ja) == said
+    assert words_of(said) == ("\u6b8b", "\u9ad8", "\u3092", "\u78ba", "\u8a8d")
+    # an added word of such a script gets no space after a word of a spaced script either, as Japanese writes it;
+    # between two words of a spaced script the space stays
+    assert written("ATM", ("\u3067",), ja) == "ATM\u3067\u3002"
+    zh = CallForm()
+    zh.final("\u6211\u60f3\u67e5\u4f59\u989d\u3002")
+    assert written("\u6211\u60f3", ("\u67e5", "\u4f59", "\u989d"), zh) == "\u6211\u60f3\u67e5\u4f59\u989d\u3002"
+    fr = CallForm()
+    fr.final("Je voudrais un billet.")
+    assert written("Je voudrais", ("un", "billet"), fr) == "Je voudrais un billet."
+
+
+# ------------------------------------------------------------------ the end of a turn
+
+
+async def test_a_turn_of_finals_only_reaches_bell():
+    # a speech-to-text that sends no interims (Gnani): no heard, but the turn's end with its words
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.40, T.FINAL_TRANSCRIPT, "Please check my balance."),
+        ev(0.40, T.END_OF_SPEECH),
+    ]
+    api = FakeAPI(v=2)
+    out, _, ends = await report_run(script, api)
+    assert out == [(typ, text) for _, typ, text, _ in script]
+    assert [m["type"] for m in api.received] == ["end_of_turn"]
+    assert ends == [{"type": "end_of_turn", "text": "Please check my balance.", "guess": "none"}]
+
+
+async def test_a_final_after_the_end_of_speech_ends_the_turn():
+    # OpenAI's realtime models with local VAD end speech first and send the final after it
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my", 0.95),
+        ev(0.80, T.END_OF_SPEECH),
+        ev(0.95, T.FINAL_TRANSCRIPT, "I'd like to check my balance."),
+    ]
+    out, stream, ends = await report_run(script, FakeAPI(answers=GUESS_AT_CHECK, v=2))
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, "I'd like"),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance."),
+        (T.END_OF_SPEECH, None),
+        (T.FINAL_TRANSCRIPT, "I'd like to check my balance."),
+    ]
+    # one turn, its final words, and Bell's guess kept (about 630 ms ahead, moved by the machine's timers)
+    assert len(ends) == 1
+    end = dict(ends[0])
+    hs = end.pop("head_start_ms")
+    assert end == {"type": "end_of_turn", "text": "I'd like to check my balance.", "guess": "kept"}
+    assert 450 <= hs <= 900, hs
+    assert stream.summary["turns"] == 1 and stream.summary["kept"] == 1
+
+
+@pytest.mark.parametrize("turn_detection", ["stt", "vad"])
+async def test_a_final_within_the_turn_holds_a_guess_only_where_livekit_replies_on_it(monkeypatch, turn_detection):
+    in_session(monkeypatch, session_with(turn_detection=turn_detection, preemptive_generation={"max_retries": 4}))
+    # a speech-to-text that finalizes a segment before the turn's end (Deepgram)
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.40, T.FINAL_TRANSCRIPT, "I'd like to check."),
+        ev(0.55, T.INTERIM_TRANSCRIPT, "my", 0.95),
+        ev(0.80, T.FINAL_TRANSCRIPT, "my balance."),
+        ev(0.80, T.END_OF_SPEECH),
+    ]
+    api = FakeAPI(answers={"I'd like to check. my": "i'd like to check my balance"}, v=3)
+    out, counts = await wrapped_run(script, api)
+    guesses = [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT]
+    if turn_detection == "stt":
+        # with the speech-to-text's endpointing LiveKit starts no early reply on that final, so none waits and the
+        # guess is sent
+        assert guesses == [(T.PREFLIGHT_TRANSCRIPT, "my balance.")]
+        assert "guess_held_while_livekit_waits" not in counts
+    else:
+        # with VAD or the turn detector LiveKit's own early reply on that final waits (rule 8)
+        assert guesses == [] and counts["guess_held_while_livekit_waits"] == 1
+
+
+# ------------------------------------------------------------------ the wrapped stream's flush
+
+
+class FlushedStream(ScriptedStream):
+    """A stream that needs a flush to finalize the turn while its STT's capability says none is needed, as a
+    FallbackAdapter's stream does when its live provider needs one and another in the list does not."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.flushes = 0
+
+    @property
+    def manual_flush(self) -> bool:
+        return True
+
+    async def _run(self) -> None:
+        async for item in self._input_ch:
+            if isinstance(item, self._FlushSentinel):
+                self.flushes += 1
+
+
+class FlushedSTT(ScriptedSTT):
+    def __init__(self):
+        super().__init__([])
+        self.made = []
+
+    def stream(self, *, language=NOT_GIVEN, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+        s = FlushedStream(stt=self, conn_options=conn_options)
+        self.made.append(s)
+        return s
+
+
+async def test_the_wrapped_streams_flush_need_is_reported_and_its_flush_passed_on():
+    inner = FlushedSTT()
+    assert getattr(inner.capabilities, "manual_flush", False) is False
+    w = rabel.STT(inner, api_key="test", base_url=f"http://127.0.0.1:{free_port()}")
+    stream = w.stream()
+    stream.push_frame(
+        rtc.AudioFrame(data=b"\x00\x00" * 160, sample_rate=16000, num_channels=1, samples_per_channel=160)
+    )
+    await asyncio.sleep(0.05)
+    # LiveKit reads the stream's need before it flushes at the end of a turn (audio_recognition's manual_flush)
+    assert stream.manual_flush is True
+    stream.flush()
+    await asyncio.sleep(0.05)
+    assert [s.flushes for s in inner.made] == [1]
+    await stream.aclose()
