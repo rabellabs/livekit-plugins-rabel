@@ -1,6 +1,7 @@
 """livekit-plugins-rabel: the wrapper's rules on a scripted speech-to-text against an in-memory stand-in of the Rabel
-API (versions 1 and 2 of its conversation), and that it fails open (API down, slow, refusing, erroring: the events
-are exactly the inner speech-to-text's).
+API (versions 1, 2 and 3 of its conversation), that it fails open (API down, slow, refusing, erroring: the events
+are exactly the inner speech-to-text's), and, in a session made of LiveKit's own fakes, that a right guess starts the
+agent's reply sooner and a wrong one never later.
 
 No network: the stand-in is handed to the plugin as its `http_session`, and its WebSocket is a pair of queues. The
 tests run on the virtual-time loop (tests/virtual_time.py). The plugin measures how late a guess is with
@@ -14,19 +15,50 @@ import asyncio
 import json
 import logging
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import aiohttp
 import pytest
 
 from livekit import rtc
-from livekit.agents import LanguageCode, __version__ as agents_version, llm, stt
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    AgentStateChangedEvent,
+    LanguageCode,
+    UserStateChangedEvent,
+    __version__ as agents_version,
+    llm,
+    stt,
+)
+from livekit.agents.testing import fake_job_context
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, TimedString
 from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.plugins import rabel
+from livekit.plugins.rabel import stt as rabel_stt
 from livekit.plugins.rabel.stt import words_of
 
+from .fake_llm import FakeLLM
+from .fake_session import FakeActions, create_session, run_session
+
+SESSION_TIMEOUT = 60.0
+
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time]
+
+# tests that keep LiveKit's own default limits outside a job; every other test runs Bell's rules at the README's setting
+_LIVEKIT_DEFAULT_TESTS = {
+    "test_the_sessions_settings_are_read_and_the_agents_come_first",
+    "test_at_livekits_default_bell_guesses_once_a_turn",
+}
+
+
+@pytest.fixture(autouse=True)
+def _four_early_starts(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Outside a job the plugin assumes LiveKit's defaults; here they stand at the README's `max_retries` 4."""
+    if request.node.originalname in _LIVEKIT_DEFAULT_TESTS:
+        return
+    monkeypatch.setattr(rabel_stt, "_DEFAULT_LIMITS", rabel_stt._HostLimits(max_starts=4))
 
 T = stt.SpeechEventType
 
@@ -50,9 +82,10 @@ def ev(at: float, typ: Any, text: str | None = None, conf: float | None = None) 
 class ScriptedSTT(stt.STT):
     """Emits (seconds after the first audio frame, event type, text, last word's confidence) in order."""
 
-    def __init__(self, script: list[tuple]) -> None:
+    def __init__(self, script: list[tuple], language: str = "en") -> None:
         super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
         self.script = script
+        self.language = language
 
     @property
     def provider(self) -> str:
@@ -91,7 +124,10 @@ class ScriptedStream(stt.RecognizeStream):
                     words[-1] = TimedString(str(words[-1]), confidence=conf)
                 alts = [
                     stt.SpeechData(
-                        language=LanguageCode("en"), text=text, words=words, confidence=0.9
+                        language=LanguageCode(getattr(self._stt, "language", "en")),
+                        text=text,
+                        words=words,
+                        confidence=0.9,
                     )
                 ]
             self._event_ch.send_nowait(stt.SpeechEvent(type=typ, alternatives=alts))
@@ -158,7 +194,8 @@ class FakeSession:
 
 class FakeAPI:
     """v: 1 answers as the API served before version 2 (a bare `ready`, guesses without `chance`); 2 as version 2
-    (`ready` with `min_chance` and `hold_line`, guesses with `chance`). mode: "ok" (guess `answers[heard words]`
+    (`ready` with `min_chance` and `hold_line`, guesses with `chance`); 3 as the API serves today (`ready` with
+    `"v": 3`: more than one guess a turn, and a guess that the turn ends on the words so far). mode: "ok" (guess `answers[heard words]`
     after `delay` s), "refuse" (an error message, then close), "garbage" (broken JSON, a guess for words never sent
     and a 400). `plan` gives a mode for each conversation in turn, the last repeating."""
 
@@ -197,6 +234,9 @@ class FakeAPI:
         if self.v == 1:
             return {"type": "ready"}
         h = self.hello or {}
+        if self.v == 3:
+            # `min_chance` as the hello set it, null when it set none: Bell's balanced setting
+            return {"type": "ready", "v": 3, "min_chance": h.get("min_chance"), "hold_line": 0.9}
         min_chance = self.min_chance
         if min_chance is None:  # the API clamps the hello's min_chance and says which is in force
             min_chance = min(max(h.get("min_chance", 0.7), 0.67), 0.99)
@@ -204,7 +244,7 @@ class FakeAPI:
 
     def _guess(self, text: str, heard: str) -> dict:
         g = {"type": "guess", "turn": 0, "id": 1, "text": text, "heard": heard}
-        if self.v == 2 and self.send_chance:
+        if self.v in (2, 3) and self.send_chance:
             g["chance"] = self.chance
         return g
 
@@ -308,8 +348,8 @@ TWO_TURNS = [
     ev(1.90, T.FINAL_TRANSCRIPT, "And my savings."),
     ev(1.90, T.END_OF_SPEECH),
 ]
-# the same with LiveKit's commit of the first turn before the second begins (an early reply waits for that
-# commit, and rule 8 holds a guess until it)
+# the same with LiveKit's commit of the first turn before the second begins (an early reply waits for that commit, and
+# rule 8 holds a guess until it)
 TWO_TURNS_COMMITTED = sorted(
     [*TWO_TURNS, ev(1.20, COMMIT, "I'd like to check my balance.")], key=lambda e: e[0]
 )
@@ -526,7 +566,7 @@ async def test_no_guess_as_third_early_start_and_none_equal_to_words() -> None:
     api = FakeAPI(answers={"yes please do": "yes please do it", "yes": "yes"})
     out, counts, _, _ = await wrapped_run(script, api)
     # a version 2 API (this stand-in): a guess must add words to the words it was made from, as 1.8.13
-    assert counts["guess_third_start"] == 1 and counts["guess_equals_words"] == 1
+    assert counts["guess_no_spare_start"] == 1 and counts["guess_equals_words"] == 1
     assert out == await plain_run(script)
 
 
@@ -644,3 +684,427 @@ async def test_report_switched_off_at_once() -> None:
     await stream.aclose()
     ends = [m for m in api.received if m["type"] == "end_of_turn"]
     assert [m.get("guess") for m in ends] == ["kept", None]
+
+
+# ------------------------------------------------------------------ version 3: guessing again, and the end bet
+
+# Bell's first guess "...check my balance" is cancelled by the words ("...check my savings"); Bell guesses again from
+# those words, and the new guess is the next early start
+AGAIN = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+    ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+    ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my savings account", 0.95),
+    ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings account."),
+    ev(0.80, T.END_OF_SPEECH),
+]
+AGAIN_ANSWERS = {
+    "I'd like to check": GUESS_BALANCE,
+    "I'd like to check my savings": "i'd like to check my savings account",
+}
+
+
+async def test_the_api_version_is_read_from_ready() -> None:
+    for v, want in ((1, False), (2, False), (3, True)):
+        stream = wrapper(TURN, FakeAPI(v=v)).stream()
+        await asyncio.sleep(0.2)
+        assert stream._bell is not None and stream._bell.v3 is want
+        await stream.aclose()
+
+
+async def test_a_new_guess_after_the_words_cancelled_the_first_is_sent_and_kept() -> None:
+    out, counts, summary, ends = await wrapped_run(AGAIN, FakeAPI(answers=AGAIN_ANSWERS, v=3))
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance."),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check my savings"),
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings account."),
+        (T.INTERIM_TRANSCRIPT, "I'd like to check my savings account"),
+        (T.FINAL_TRANSCRIPT, "I'd like to check my savings account."),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["guess_sent"] == 2 and counts["guess_cancelled_by_words"] == 1
+    # the report: the last guess kept, the one before it dropped
+    assert ends[-1]["guess"] == "kept" and ends[-1]["dropped_before"] == 1
+    assert (summary["guesses"], summary["kept"], summary["dropped"]) == (2, 1, 1)
+    # a version 2 API: one guess a turn
+    _, counts, _, _ = await wrapped_run(AGAIN, FakeAPI(answers=AGAIN_ANSWERS))
+    assert counts["guess_sent"] == 1 and counts["guess_not_first"] == 1
+
+
+async def test_one_guess_alive_and_never_the_last_early_start() -> None:
+    # a second guess that comes while the first is the running early start, the words still agreeing with it
+    api = FakeAPI(answers={**AT_CHECK, "I'd like to check my": "i'd like to check my card"}, v=3)
+    out, counts, _, _ = await wrapped_run(TURN, api)
+    assert [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT] == [
+        (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.")
+    ]
+    assert counts["guess_sent"] == 1 and counts["guess_while_live"] == 1
+    # two guesses each cancelled by the words have taken two of LiveKit's three early starts: a third is not sent,
+    # so LiveKit has one left for the final
+    script = [
+        *AGAIN[:3],
+        ev(0.55, T.INTERIM_TRANSCRIPT, "I'd like to check my savings balance", 0.95),
+        ev(0.80, T.FINAL_TRANSCRIPT, "I'd like to check my savings balance today."),
+        ev(0.80, T.END_OF_SPEECH),
+    ]
+    answers = {
+        **AGAIN_ANSWERS,
+        "I'd like to check my savings balance": "i'd like to check my savings balance today",
+    }
+    out, counts, _, _ = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    assert counts["guess_sent"] == 2 and counts["guess_cancelled_by_words"] == 2
+    assert counts["guess_no_spare_start"] == 1
+    assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings balance today.") not in out
+
+
+
+async def test_at_livekits_default_bell_guesses_once_a_turn() -> None:
+    # LiveKit's default of 3: one guess leaves two starts (the final's and a spare); a second would leave one
+    out, counts, _, _ = await wrapped_run(AGAIN, FakeAPI(answers=AGAIN_ANSWERS, v=3))
+    assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["not-committed", "committed"])
+async def test_the_count_runs_until_livekit_commits(committed: bool) -> None:
+    # a wrong guess (start 1) and LiveKit's own start at the first final (start 2); the caller pauses and goes on. Not
+    # committed, LiveKit's turn runs on with two starts used and a guess would leave it one; committed, the count starts again
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+        ev(0.50, T.FINAL_TRANSCRIPT, "I'd like to check my savings."),
+        ev(0.50, T.END_OF_SPEECH),
+        *([ev(0.70, COMMIT, "I'd like to check my savings.")] if committed else []),
+        ev(0.90, T.START_OF_SPEECH),
+        ev(0.95, T.INTERIM_TRANSCRIPT, "and my", 0.95),
+        ev(1.20, T.INTERIM_TRANSCRIPT, "and my card", 0.95),
+        ev(1.40, T.FINAL_TRANSCRIPT, "And my card."),
+        ev(1.40, T.END_OF_SPEECH),
+    ]
+    answers = {"I'd like to check": "i'd like to check my balance", "and my": "and my card"}
+    out, counts, _, _ = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    if committed:
+        assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
+    else:
+        assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+
+async def test_the_end_bet_is_sent_on_the_words_so_far() -> None:
+    # a guess equal to the words it was made from: Bell bets the turn is over there. It is sent as the early start on
+    # the words exactly as the speech-to-text showed them, and kept when the turn ends on them
+    said = "I'd like to check my balance."
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, said, 0.95),
+        ev(0.40, T.FINAL_TRANSCRIPT, said),
+        ev(0.40, T.END_OF_SPEECH),
+    ]
+    out, counts, _, ends = await wrapped_run(script, FakeAPI(answers={said: GUESS_BALANCE}, v=3))
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, said),
+        (T.PREFLIGHT_TRANSCRIPT, said),
+        (T.FINAL_TRANSCRIPT, said),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["end_bet_sent"] == 1 and ends[-1]["guess"] == "kept"
+    # from a version 2 API a guess must add words, so this one is not sent
+    out, counts, _, _ = await wrapped_run(script, FakeAPI(answers={said: GUESS_BALANCE}))
+    assert out == await plain_run(script) and counts["guess_equals_words"] == 1
+
+
+# ------------------------------------------------------------------ the session's own settings (rule 6)
+
+
+def in_session(monkeypatch: pytest.MonkeyPatch, session: Any) -> None:
+    """The job's primary session, as `get_job_context` gives it to the plugin inside a running job."""
+    monkeypatch.setattr(
+        rabel_stt,
+        "get_job_context",
+        lambda *, required=True: SimpleNamespace(primary_session=session),
+    )
+
+
+def session_with(**turn_handling: Any) -> AgentSession:
+    return AgentSession(turn_handling=turn_handling)  # type: ignore[arg-type]
+
+
+def session_like(session: AgentSession, **kw: Any) -> SimpleNamespace:
+    """What the plugin reads of a session, with the parts a test sets (an agent, its reply under way)."""
+    base: dict[str, Any] = {
+        "options": session.options,
+        "turn_detection": session.turn_detection,
+        "llm": None,
+        "current_agent": None,
+        "current_speech": None,
+    }
+    return SimpleNamespace(**{**base, **kw})
+
+
+async def test_the_sessions_settings_are_read_and_the_agents_come_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits, read = rabel_stt._HostLimits, rabel_stt._host_limits
+    defaults = limits(early_replies=True, max_starts=3, max_speech_s=10.0, agent_speaking=False)
+    # no job (a developer's own script): LiveKit's defaults
+    assert read() == defaults
+    in_session(monkeypatch, session_with())
+    assert read() == defaults
+
+    in_session(
+        monkeypatch,
+        session_with(preemptive_generation={"max_retries": 1, "max_speech_duration": 4}),
+    )
+    assert read() == limits(max_starts=1, max_speech_s=4.0)
+
+    # where LiveKit starts no early reply: preemptive generation off, turns ended by hand, a realtime model
+    in_session(monkeypatch, session_with(preemptive_generation={"enabled": False}))
+    assert read().early_replies is False
+    in_session(monkeypatch, session_with(turn_detection="manual"))
+    assert read().early_replies is False
+    not_an_llm = object()  # stands for a realtime model: anything that is not an llm.LLM
+    in_session(monkeypatch, session_like(session_with(), llm=not_an_llm))
+    assert read().early_replies is False
+
+    # the running agent's own settings come before the session's, as LiveKit resolves them
+    agent = Agent(
+        instructions="x",
+        turn_handling={"preemptive_generation": {"max_retries": 1}, "turn_detection": "manual"},
+    )
+    session = session_with(preemptive_generation={"max_retries": 2})
+    in_session(monkeypatch, session_like(session, current_agent=agent))
+    assert read() == limits(early_replies=False, max_starts=1)
+
+    # the agent's reply under way, until the caller interrupts it
+    in_session(
+        monkeypatch, session_like(session, current_speech=SimpleNamespace(interrupted=False))
+    )
+    assert read().agent_speaking is True
+    in_session(monkeypatch, session_like(session, current_speech=SimpleNamespace(interrupted=True)))
+    assert read().agent_speaking is False
+
+    # a job with no session started, or settings that cannot be read: LiveKit's defaults, never an error
+    class NoSession:
+        @property
+        def primary_session(self) -> AgentSession:
+            raise RuntimeError("No AgentSession was started for this job")
+
+    monkeypatch.setattr(rabel_stt, "get_job_context", lambda *, required=True: NoSession())
+    assert read() == defaults
+    in_session(monkeypatch, object())
+    assert read() == defaults
+
+
+@pytest.mark.parametrize(
+    "session_kw, count",
+    [
+        ({"preemptive_generation": {"enabled": False}}, "guess_no_early_reply"),
+        ({"turn_detection": "manual"}, "guess_no_early_reply"),
+        # a guess would take the turn's only early start; were it wrong, LiveKit could start none on the final words
+        ({"preemptive_generation": {"max_retries": 1}}, "guess_no_spare_start"),
+        ({"preemptive_generation": {"max_speech_duration": 0.2}}, "guess_past_10s"),
+    ],
+    ids=[
+        "early-replies-off",
+        "turns-ended-by-hand",
+        "one-early-start-a-turn",
+        "past-the-limit-of-speech",
+    ],
+)
+async def test_no_guess_where_livekit_would_start_no_early_reply(
+    session_kw: dict, count: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    in_session(monkeypatch, session_with(**session_kw))
+    api = FakeAPI(answers=AT_CHECK, v=3)
+    out, counts, _, ends = await wrapped_run(TURN, api)
+    assert out == await plain_run(TURN)
+    assert counts[count] == 1 and "guess_sent" not in counts
+    # Bell still hears the turn, and the report says no guess was passed on
+    assert [m["type"] for m in api.received].count("heard") == 4
+    assert ends == [
+        {"type": "end_of_turn", "text": "I'd like to check my balance.", "guess": "none"}
+    ]
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["speaking", "interrupted"])
+async def test_no_guess_while_the_agents_reply_is_under_way(
+    interrupted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a guess then would start nothing, and its words would count as the caller's where LiveKit counts the words that
+    # interrupt the agent (`min_words`); once the caller has interrupted the reply, a guess is an early start again
+    speech = SimpleNamespace(interrupted=interrupted)
+    in_session(monkeypatch, session_like(session_with(), current_speech=speech))
+    out, counts, _, _ = await wrapped_run(TURN, FakeAPI(answers=AT_CHECK, v=3))
+    if interrupted:
+        assert counts["guess_sent"] == 1 and "guess_while_agent_speaks" not in counts
+    else:
+        assert out == await plain_run(TURN)
+        assert counts["guess_while_agent_speaks"] == 1 and "guess_sent" not in counts
+
+
+# ------------------------------------------------------------------ in a session: the reply's start
+#
+# LiveKit's own fakes (the VAD, the LLM, the voice, the audio in and out) with the plugin around a scripted
+# speech-to-text, inside a job, as `tests/test_agent_session.py` measures preemptive generation. The caller speaks from
+# 0.5 s to 2.0 s; the final transcript comes 0.1 s after; the LLM takes 1.0 s and the voice 0.3 s to its first audio;
+# LiveKit ends the turn 0.5 s after the caller stops.
+#   Without Bell the LLM starts at the final:                 0.1 + 1.0 + 0.3 = 1.4 s from the caller's last word.
+#   On a right guess the LLM started 0.78 s before that word: 0.5 + 0.3       = 0.8 s.
+
+SAID = "I'd like to check my balance."
+SPOKEN = [
+    ev(0.50, T.START_OF_SPEECH),
+    ev(0.80, T.INTERIM_TRANSCRIPT, "I'd like", 0.95),
+    ev(1.20, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+    ev(2.10, T.FINAL_TRANSCRIPT, SAID),
+    ev(2.10, T.END_OF_SPEECH),
+]
+WRONG = "I'd like to check my card."
+
+
+async def reply_latency(stt_: stt.STT, **turn_handling: Any) -> tuple[float, int]:
+    """Seconds from the caller's last word to the agent's first audio, and the LLM requests made."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, SAID, stt_delay=0.1)
+    actions.add_llm("Sure, one moment.", input=SAID, ttft=0.9, duration=1.0)
+    actions.add_llm("Which card?", input=WRONG, ttft=0.9, duration=1.0)
+    actions.add_tts(1.0, input="Sure, one moment.", ttfb=0.3)
+    actions.add_tts(1.0, input="Which card?", ttfb=0.3)
+    session = create_session(actions, turn_handling=dict(turn_handling), with_stt=False)
+    llm_ = session.llm
+    assert isinstance(llm_, FakeLLM)
+    requests = 0
+    chat = llm_.chat
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        nonlocal requests
+        requests += 1
+        return chat(*args, **kwargs)
+
+    llm_.chat = counted  # type: ignore[method-assign]
+    agent_states: list[AgentStateChangedEvent] = []
+    user_states: list[UserStateChangedEvent] = []
+    session.on("agent_state_changed", agent_states.append)
+    session.on("user_state_changed", user_states.append)
+    with fake_job_context():
+        await asyncio.wait_for(
+            run_session(session, Agent(instructions="x", stt=stt_)), timeout=SESSION_TIMEOUT
+        )
+    stopped = next(e for e in user_states if e.new_state == "listening").speech_timestamp
+    spoke = next(e for e in agent_states if e.new_state == "speaking").created_at
+    assert stopped is not None
+    return spoke - stopped, requests
+
+
+@pytest.mark.no_concurrent
+async def test_in_a_session_a_right_guess_starts_the_reply_sooner_and_a_wrong_one_never_later() -> (
+    None
+):
+    plain, plain_requests = await reply_latency(ScriptedSTT(SPOKEN))
+    assert plain == pytest.approx(1.4, abs=0.2) and plain_requests == 1
+
+    right = wrapper(SPOKEN, FakeAPI(answers=AT_CHECK, v=3))
+    latency, requests = await reply_latency(right)
+    assert latency == pytest.approx(0.8, abs=0.2) and requests == 1
+    assert next(iter(right._streams)).counts["guess_sent"] == 1
+
+    # a wrong guess: LiveKit drops its reply at the final and starts on the caller's words, as it does without Bell,
+    # at the cost of one more LLM request
+    wrong = wrapper(
+        SPOKEN, FakeAPI(answers={"I'd like to check": "i'd like to check my card"}, v=3)
+    )
+    latency, requests = await reply_latency(wrong)
+    assert latency == pytest.approx(plain, abs=0.05) and requests == 2
+
+
+@pytest.mark.no_concurrent
+async def test_in_a_session_with_one_early_start_a_turn_a_wrong_guess_costs_nothing() -> None:
+    # `max_retries` 1: a guess would take the turn's only early start, and LiveKit could start none on the final words;
+    # the reply would start at LiveKit's end of turn (0.5 + 1.0 + 0.3 = 1.8 s). The plugin reads the session's limit
+    # through the job and sends no guess.
+    one = {"preemptive_generation": {"max_retries": 1}}
+    plain, _ = await reply_latency(ScriptedSTT(SPOKEN), **one)
+    wrong = wrapper(
+        SPOKEN, FakeAPI(answers={"I'd like to check": "i'd like to check my card"}, v=3)
+    )
+    latency, requests = await reply_latency(wrong, **one)
+    assert latency == pytest.approx(plain, abs=0.05) and requests == 1
+    counts = next(iter(wrong._streams)).counts
+    assert counts["guess_no_spare_start"] == 1 and "guess_sent" not in counts
+
+
+async def run_in(
+    language: str, script: list[tuple], api: FakeAPI
+) -> tuple[list[tuple], list[dict]]:
+    """wrapped_run with a speech-to-text that says its words are in `language`"""
+    w = rabel.STT(
+        ScriptedSTT(script, language=language),
+        api_key="test",
+        base_url="https://api.example",
+        http_session=FakeSession(api),  # type: ignore[arg-type]
+    )
+    out = await collect(w)
+    return out, [m for m in api.received if m["type"] == "end_of_turn"]
+
+
+# ------------------------------------------------------------------ a language other than English
+#
+# Under LiveKit's default turn detection an early reply is kept only when the final transcript is the same string as the
+# early start's, so the guess is written the way the final will be. For English that is `final_form`'s rules. For any
+# other language it is the call's own form: how this call's final transcripts have been written so far.
+
+FIRST_HI = "\u092e\u0947\u0930\u093e \u0928\u093e\u092e \u0930\u093e\u092e \u0939\u0948\u0964"
+HEARD_HI = "\u092e\u0941\u091d\u0947 \u0905\u092a\u0928\u093e \u092c\u0948\u0932\u0947\u0902\u0938"
+REST_HI = "\u091a\u0947\u0915 \u0915\u0930\u0928\u093e \u0939\u0948"
+SAID_HI = (
+    HEARD_HI + " " + REST_HI + "\u0964"
+)  # the turn as the speech-to-text writes it, closed with Hindi's own mark
+HINDI = [
+    ev(0.00, T.START_OF_SPEECH),
+    ev(0.05, T.INTERIM_TRANSCRIPT, FIRST_HI[:8], 0.95),
+    ev(0.30, T.FINAL_TRANSCRIPT, FIRST_HI),
+    ev(0.30, T.END_OF_SPEECH),
+    ev(0.45, COMMIT, FIRST_HI),
+    ev(0.60, T.START_OF_SPEECH),
+    ev(0.65, T.INTERIM_TRANSCRIPT, HEARD_HI, 0.95),
+    ev(1.10, T.FINAL_TRANSCRIPT, SAID_HI),
+    ev(1.10, T.END_OF_SPEECH),
+]
+
+
+@pytest.mark.parametrize("language, kept", [("hi", True), ("en", False), ("multi", False)])
+async def test_another_language_is_written_as_the_calls_own_finals_were(language, kept) -> None:
+    api = FakeAPI(answers={HEARD_HI: HEARD_HI + " " + REST_HI}, v=3)
+    out, ends = await run_in(language, HINDI, api)
+    guess = [text for typ, text in out if typ == T.PREFLIGHT_TRANSCRIPT]
+    if kept:
+        # the call's first final closed with Hindi's own mark, so the guess does, and it is the final's string
+        assert guess == [SAID_HI] and ends[-1]["guess"] == "kept"
+    else:
+        # English, or a speech-to-text that names no one language: the English rules, as before
+        assert guess == [HEARD_HI + " " + REST_HI + "."] and ends[-1]["guess"] == "dropped"
+
+
+def test_the_calls_own_form() -> None:
+    from livekit.plugins.rabel._form import CallForm, final_form, written
+
+    form = CallForm()
+    # before any final transcript there is nothing to copy: the guess is written as `final_form` writes it
+    assert written("Je voudrais", ("un", "billet"), form) == final_form(
+        "Je voudrais", ("un", "billet")
+    )
+    form.final("Je voudrais v\u00e9rifier mon solde.")
+    form.final("Pouvez-vous l'emmener \u00e0 l'h\u00f4tel ?")
+    # a word as this call wrote it (its apostrophe back), and the turn closed as it closed after the same opening word
+    assert written("Pouvez-vous", ("lemmener",), form) == "Pouvez-vous l'emmener ?"
+    assert written("Je voudrais", ("un", "billet"), form) == "Je voudrais un billet."
+    # an opening word not heard yet: the way most of the call's turns have closed
+    form.final("Combien co\u00fbte le billet ?")
+    assert written("Quel est", ("le", "prix"), form) == "Quel est le prix ?"
+    # a guess that adds nothing (the end bet) is the speech-to-text's own text
+    assert written("Je voudrais un billet", (), form) == "Je voudrais un billet"
+    # a speech-to-text that writes no capitals and no marks is copied as it is
+    plain = CallForm()
+    plain.final("mera naam ram hai")
+    assert written("", ("mujhe", "balance"), plain) == "mujhe balance"

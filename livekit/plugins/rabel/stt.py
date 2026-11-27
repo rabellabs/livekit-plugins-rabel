@@ -39,9 +39,15 @@ The rules, applied to the inner speech-to-text's events while a guess of Bell's 
   6. Nothing is sent past the session's limits for preemptive generation (`max_retries`, 3 by default, and
      `max_speech_duration`, 10 s by default; the session's own values are read, the agent's over the session's, and
      LiveKit's defaults are used when there is no job to read them from): one guess alive at a time (one guess a turn
-     with an API that answers a version 1 or 2 `ready`), never as the last early start the session allows in a turn (the
-     third by default; with `max_retries` 1 Bell sends none), none after the limit of speech, never a guess equal to the
-     running early start. No guess is sent where LiveKit starts no early reply at all: preemptive generation switched
+     with an API that answers a version 1 or 2 `ready`), and a guess only while LiveKit has at least two early starts
+     left after it: one for the caller's final words and one spare for a turn the caller goes on with after a pause.
+     LiveKit counts its early starts from one commit to the next (agent_activity's `_preemptive_generation_count`,
+     reset only when a turn is completed), so a caller who pauses, is not committed and goes on speaking is still in
+     the same turn; the count here is LiveKit's: every early start passed since LiveKit's last commit (Bell's, the
+     speech-to-text's, and LiveKit's own at a final that changes its text), started again when LiveKit adds the
+     caller's message to the conversation (rule 8's commit). At LiveKit's default of 3 that is one guess a turn; with
+     `max_retries` 4, two; with 2 or fewer, none. None after the limit of speech, never a guess equal to the running
+     early start. No guess is sent where LiveKit starts no early reply at all: preemptive generation switched
      off, turns ended by hand (`turn_detection="manual"`), a realtime model in place of the LLM, or while the agent's
      reply is under way and the caller has not interrupted it. There a guess would start nothing and would only replace
      the caller's words in LiveKit's text. Nor is a guess sent once the
@@ -585,6 +591,10 @@ class SpeechStream(stt.RecognizeStream):
         self._lk_has_text = False
         # rule 8: LiveKit's own early reply made on a final is waiting for LiveKit's commit
         self._lk_waiting = False
+        # rule 6: the early starts LiveKit has made since its last commit, as LiveKit counts them (agent_activity:
+        # `_preemptive_generation_count`, reset only when a turn is completed): a turn of the speech-to-text's can end and
+        # another begin before LiveKit commits, and LiveKit's count runs on over both
+        self._lk_starts = 0
         # how this call's speech-to-text has written its final transcripts, for a guess in a language other than English
         self._form = CallForm()
         # what this stream's guesses did for the host, for the summary logged when it closes (numbers only)
@@ -762,6 +772,16 @@ class SpeechStream(stt.RecognizeStream):
             else:
                 # LiveKit starts its own early reply on a final that changes its text (audio_recognition: transcript_changed)
                 changed = pre is None or text.strip() != pre.strip()
+            if changed:
+                lim = _host_limits()
+                if (
+                    lim.early_replies
+                    and not lim.agent_speaking
+                    and self._lk_starts < lim.max_starts
+                    and time.time() - t.speech_start <= lim.max_speech_s
+                ):
+                    # rule 6: LiveKit's own early start on this final (or rule 7's) counts against its turn
+                    self._lk_starts += 1
             self._lk_pre, self._lk_pre_stale = None, False
             if changed or (self._v3() and t.running is not None and t.running == t.words):
                 # rule 8: an early reply now waits for LiveKit's commit: LiveKit's own, made on this final, or (version 3)
@@ -782,7 +802,7 @@ class SpeechStream(stt.RecognizeStream):
                 t.held = None
                 return []
             lim = _host_limits()
-            if t.bell_sent and t.running is not None and t.starts >= lim.max_starts:
+            if t.bell_sent and t.running is not None and self._lk_starts >= lim.max_starts:
                 # rule 9: no early start is left (Bell's guess took one); LiveKit would cancel the running reply and start
                 # none, so the reply under way is left to run
                 self._count("eager_held_no_start_left")
@@ -793,11 +813,12 @@ class SpeechStream(stt.RecognizeStream):
             if (
                 lim.early_replies
                 and not lim.agent_speaking
-                and t.starts < lim.max_starts
+                and self._lk_starts < lim.max_starts
                 and time.time() - t.speech_start <= lim.max_speech_s
             ):
                 t.starts += 1
                 t.stt_starts += 1
+                self._lk_starts += 1
                 t.running = w
             else:
                 t.running = None
@@ -977,6 +998,8 @@ class SpeechStream(stt.RecognizeStream):
         on_preemptive_generation), while the guess's text would stay remembered (rule 7's case) for the next final."""
         try:
             self._lk_waiting = False
+            # rule 6: LiveKit's count of early starts starts again at its commit
+            self._lk_starts = 0
             # LiveKit's turn text restarts at its commit, so the remembered text can no longer equal a final
             self._lk_pre, self._lk_pre_stale = None, False
             self._lk_has_text = False
@@ -1133,10 +1156,10 @@ class SpeechStream(stt.RecognizeStream):
         if t.running is not None and g == t.running:
             self._count("guess_same_as_running")
             return None
-        if t.starts >= lim.max_starts - 1:
-            # the last early start the session allows in a turn is left for the speech-to-text's own and for
-            # LiveKit's at the final (the third, at LiveKit's default)
-            self._count("guess_third_start")
+        if self._lk_starts + 1 > lim.max_starts - 2:
+            # rule 6: after this guess LiveKit must still have two early starts left in its turn: one for the caller's
+            # final words, one spare for a turn the caller goes on with after a pause
+            self._count("guess_no_spare_start")
             return None
         if t.stt_starts >= 1:
             # rule 6: the speech-to-text has made its own early start in this turn: a guess now would cancel that start,
@@ -1186,6 +1209,7 @@ class SpeechStream(stt.RecognizeStream):
         t.waiting_guess = None
         t.sent_at = time.monotonic()
         t.starts += 1
+        self._lk_starts += 1
         t.running = t.live = g
         t.held = None
         self._lk_pre, self._lk_pre_stale = text, False

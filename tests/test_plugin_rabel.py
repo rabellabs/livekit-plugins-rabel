@@ -22,6 +22,17 @@ from livekit.plugins.rabel.stt import words_of
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.fixture(autouse=True)
+def _four_early_starts(request, monkeypatch):
+    """Bell's rules are tested at the README's setting, `max_retries` 4, outside a job (where the plugin assumes LiveKit's
+    defaults). Tests marked `livekit_default` keep LiveKit's own default of 3."""
+    if request.node.get_closest_marker("livekit_default"):
+        return
+    from livekit.plugins.rabel import stt as rabel_stt
+
+    monkeypatch.setattr(rabel_stt, "_DEFAULT_LIMITS", rabel_stt._HostLimits(max_starts=4))
+
 T = stt.SpeechEventType
 
 
@@ -722,8 +733,9 @@ async def test_guess_held_while_livekits_own_reply_waits(commit_at, sent, count)
 
 
 async def test_held_guess_refused_when_the_stts_own_early_start_replaces_livekits_reply():
-    # rule 8 takes the held guess again at the speech-to-text's own early start; that start came first in the turn, so
-    # rule 6 refuses the guess (sent, it would cancel that start), and the events are the speech-to-text's
+    # rule 8 takes the held guess again at the speech-to-text's own early start; LiveKit has made two starts since its
+    # last commit (its own at the first final, the speech-to-text's), so rule 6 refuses the guess (no spare start
+    # after it), and the events are the speech-to-text's
     script = [
         *BEFORE,
         ev(0.60, T.START_OF_SPEECH),
@@ -737,7 +749,7 @@ async def test_held_guess_refused_when_the_stts_own_early_start_replaces_livekit
     ]
     out, counts = await wrapped_run(script, FakeAPI(answers=SAVINGS, v=2))
     assert out == await plain_run(script)
-    assert counts["guess_held_while_livekit_waits"] == 1 and counts["guess_after_stt_start"] == 1
+    assert counts["guess_held_while_livekit_waits"] == 1 and counts["guess_no_spare_start"] == 1
     assert "guess_sent" not in counts
 
 
@@ -1105,7 +1117,7 @@ async def test_no_guess_as_third_early_start_and_none_equal_to_words():
         api = FakeAPI(answers={"yes please do": "yes please do it", "yes": "yes"}, v=v)
         out, counts = await wrapped_run(script, api)
         assert (T.PREFLIGHT_TRANSCRIPT, "yes please do it") not in out
-        assert counts["guess_third_start"] == 1
+        assert counts["guess_no_spare_start"] == 1
         if v == 2:
             # as 1.8.13: a guess must add words to the words it was made from
             assert counts["guess_equals_words"] == 1
@@ -1207,7 +1219,7 @@ async def test_guessing_again_never_takes_the_third_early_start():
     }
     out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
     assert counts["guess_sent"] == 2 and counts["guess_cancelled_by_words"] == 2
-    assert counts["guess_third_start"] == 1
+    assert counts["guess_no_spare_start"] == 1
     assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings balance today.") not in out
 
 
@@ -1223,7 +1235,7 @@ async def test_no_new_guess_after_the_stts_own_early_start_replaced_bells():
         ev(0.80, T.END_OF_SPEECH),
     ]
     out, counts = await wrapped_run(script, FakeAPI(answers=AGAIN_ANSWERS, v=3))
-    assert counts["guess_sent"] == 1 and counts["guess_third_start"] == 1
+    assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
     assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my savings account.") not in out
 
 
@@ -1567,6 +1579,7 @@ NO_START_LEFT = [
 ]
 
 
+@pytest.mark.livekit_default
 async def test_no_start_left_the_stts_early_start_is_held_back():
     api = FakeAPI(answers={"The company": "the company is smart electric"}, v=2)
     out, counts = await wrapped_run(NO_START_LEFT, api)
@@ -2344,6 +2357,7 @@ def session_with(**turn_handling):
     return AgentSession(turn_handling=turn_handling)
 
 
+@pytest.mark.livekit_default
 async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypatch):
     import types
 
@@ -2434,21 +2448,63 @@ async def test_no_guess_where_livekit_starts_no_early_reply(turn_handling, monke
     }
 
 
+
+@pytest.mark.livekit_default
+async def test_at_livekits_default_bell_guesses_once_a_turn():
+    # LiveKit's default of 3: one guess leaves two starts (the final's and a spare); a second would leave one
+    script = [*AGAIN]
+    out, counts = await wrapped_run(script, FakeAPI(answers=AGAIN_ANSWERS, v=3))
+    assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+
+
+@pytest.mark.parametrize("committed, sent", [(False, False), (True, True)], ids=["not-committed", "committed"])
+async def test_the_count_runs_until_livekit_commits(committed, sent):
+    # at max_retries 4: a wrong guess (start 1) and LiveKit's own start at the first final (start 2). The caller pauses and
+    # goes on. Not committed, LiveKit's turn runs on with two starts used, and a guess now would leave it one; once
+    # LiveKit has committed, its count starts again and the next turn's guess is sent
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+        ev(0.50, T.FINAL_TRANSCRIPT, "I'd like to check my savings."),
+        ev(0.50, T.END_OF_SPEECH),
+        *([ev(0.70, COMMIT, "I'd like to check my savings.")] if committed else []),
+        ev(0.90, T.START_OF_SPEECH),
+        ev(0.95, T.INTERIM_TRANSCRIPT, "and my", 0.95),
+        ev(1.20, T.INTERIM_TRANSCRIPT, "and my card", 0.95),
+        ev(1.40, T.FINAL_TRANSCRIPT, "And my card."),
+        ev(1.40, T.END_OF_SPEECH),
+    ]
+    answers = {"I'd like to check": "i'd like to check my balance", "and my": "and my card"}
+    out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    if sent:
+        assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
+    else:
+        assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+
 async def test_with_one_early_start_a_turn_bell_sends_no_guess(monkeypatch):
     # `max_retries` 1: a guess would take the turn's only early start; were it wrong, LiveKit could start none on the
     # final words, and the reply would start later than without Bell
     in_session(monkeypatch, session_with(preemptive_generation={"max_retries": 1}))
     out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
     assert out == await plain_run(TURN)
-    assert counts["guess_third_start"] == 1 and "guess_sent" not in counts
+    assert counts["guess_no_spare_start"] == 1 and "guess_sent" not in counts
 
 
-async def test_with_two_early_starts_a_turn_bell_takes_only_the_first(monkeypatch):
+async def test_with_two_early_starts_a_turn_bell_sends_no_guess(monkeypatch):
+    # a guess would leave LiveKit one early start: none spare for a caller who pauses and goes on
     in_session(monkeypatch, session_with(preemptive_generation={"max_retries": 2}))
+    out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    assert out == await plain_run(TURN)
+    assert counts["guess_no_spare_start"] == 1 and "guess_sent" not in counts
+
+
+async def test_with_three_early_starts_bell_guesses_once_and_not_after_the_stts_start(monkeypatch):
+    in_session(monkeypatch, session_with(preemptive_generation={"max_retries": 3}))
     out, counts = await wrapped_run(TURN, FakeAPI(answers=GUESS_AT_CHECK, v=3))
     assert (T.PREFLIGHT_TRANSCRIPT, "I'd like to check my balance.") in out
     assert counts["guess_sent"] == 1
-    # after the speech-to-text's own early start one is left, and it is not Bell's
+    # after the speech-to-text's own early start two are left, and neither is Bell's
     script = [
         ev(0.00, T.START_OF_SPEECH),
         ev(0.05, T.PREFLIGHT_TRANSCRIPT, "I'd like", 0.95),
@@ -2458,7 +2514,7 @@ async def test_with_two_early_starts_a_turn_bell_takes_only_the_first(monkeypatc
     ]
     out, counts = await wrapped_run(script, FakeAPI(answers=GUESS_AT_CHECK, v=3))
     assert out == await plain_run(script)
-    assert counts["guess_third_start"] == 1 and "guess_sent" not in counts
+    assert counts["guess_no_spare_start"] == 1 and "guess_sent" not in counts
 
 
 async def test_no_guess_after_the_sessions_limit_of_speech(monkeypatch):
@@ -2468,6 +2524,7 @@ async def test_no_guess_after_the_sessions_limit_of_speech(monkeypatch):
     assert counts["guess_past_10s"] == 1 and "guess_sent" not in counts
 
 
+@pytest.mark.livekit_default
 async def test_a_started_session_is_read_through_its_job():
     # no stand-in for LiveKit here: a real session, started inside a job as LiveKit's own test helper makes one
     from livekit.agents import Agent, AgentSession
