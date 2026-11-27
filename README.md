@@ -47,7 +47,7 @@ the seconds it is open, silence included.
 
 ## Usage
 
-Wrap the speech-to-text you already use. This is the one changed line:
+Wrap the speech-to-text you already use, and give preemptive generation one more early start a turn:
 
 ```python
 from livekit.agents import AgentSession
@@ -55,9 +55,13 @@ from livekit.plugins import deepgram, rabel
 
 session = AgentSession(
     stt=rabel.STT(deepgram.STTv2(model="flux-general-en"), agent="front-desk"),
+    turn_handling={"preemptive_generation": {"max_retries": 4}},
     ...
 )
 ```
+
+`max_retries` 4 lets Bell guess again in a turn when the caller's words go past its first guess, and still leaves
+LiveKit two early starts of its own. At LiveKit's default of 3 the plugin works too, with one guess a turn.
 
 A new agent starts with nothing learned, and Bell sends no guess until it has learned from enough of that agent's own
 calls. The API's `ready` message, which opens each conversation, carries `calls_heard`: how many of the agent's calls
@@ -91,8 +95,10 @@ not read with it on.
   guess that the caller has finished.
 - The plugin keeps within your session's limits for preemptive generation (`max_retries`, 3 by default, and
   `max_speech_duration`, 10 s by default). It reads them from the session, and from the running agent where the agent
-  sets its own. A guess is never the last early start the session allows in a turn, and is never sent after the limit
-  of speech.
+  sets its own. It sends a guess only while LiveKit would still have two early starts left after it: one for the
+  caller's final words, and one spare for a caller who pauses and goes on before LiveKit ends the turn. It counts the
+  early starts as LiveKit does, from one end of turn to the next, across pauses. No guess is sent after the limit of
+  speech.
 - Where LiveKit starts no early reply, Bell sends no guess: with preemptive generation off, with
   `turn_detection="manual"`, with a realtime model in place of the LLM, and while your agent's reply is under way and
   the caller has not interrupted it.
@@ -108,9 +114,8 @@ not read with it on.
   later. The plugin sees LiveKit's end of turn through the session's `stt_context_options` `forward_chat_context`, on by
   default. With it off, the plugin holds every guess that comes after such a reply begins to wait.
 
-These rules make it rare for a guess to start a reply later than it would have started without Bell. Rare is not never.
-In the benchmark's run of 26 November 2026 (376 scripted calls to one bank, 2,193 turns), the reply started later than
-without Bell on 6 turns.
+So a guess never makes your agent's reply start later than it would have started without Bell.
+<!-- n:never_later_line -->In the public benchmark's run of 27 November 2026 with `livekit-plugins-rabel` 1.9.0.1 (376 scripted calls to one bank, 2,030 turns with a reply), no reply started later with Bell than without it.<!-- /n -->
 
 ## Options
 
@@ -157,11 +162,9 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   plugin has nothing to copy until the call's first final transcript, so under LiveKit's own turn detection a right
   guess in a call's first turn is usually not kept, and later turns depend on how evenly your speech-to-text writes.
   With `turn_detection="stt"`, LiveKit compares words and the writing does not matter.
-- **A later reply is rare, not impossible.** On some turns a guess can still start the reply later than it would have
-  started without Bell.
-- **Lower preemptive-generation limits mean fewer guesses.** The plugin never takes the last early start of a turn, so
-  LiveKit always has one left for the caller's real words. With `max_retries` 2, Bell's guess can only be a turn's
-  first early start. With `max_retries` 1, Bell sends none. Outside a LiveKit job (a script that drives the
+- **Lower preemptive-generation limits mean fewer guesses.** The plugin always leaves LiveKit two early starts of its
+  own in a turn. With `max_retries` 4 Bell can guess twice in a turn, at LiveKit's default of 3 once, and with 2 or
+  fewer it sends none. Outside a LiveKit job (a script that drives the
   speech-to-text by itself) the plugin cannot read the session and assumes LiveKit's defaults.
 - **While your agent is speaking, Bell sends no guess.** LiveKit starts no early reply until the caller has interrupted
   the agent, and a guess's words would count as the caller's where LiveKit counts the words needed to interrupt
