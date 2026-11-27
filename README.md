@@ -187,5 +187,6 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   `bad_message`, 401 `bad_key`, 402 `no_seconds` or 404 `unknown_agent` ends Bell for that stream. Broken data from the
   API is ignored. A guess that comes late, under `min_chance` or after its turn has ended is dropped. With no API key, or
   `enabled=False`, no connection is opened. A conversation that closes cleanly after a minute or more (the API closes
-  one after an hour) is reopened at once; any other is reopened as when the API is down. The tests run each of these
-  cases against a local stand-in for versions 1, 2 and 3 of Rabel's API.
+  one after an hour) is reopened at once; any other is reopened as when the API is down. A connection that goes silent
+  is noticed within 15 s and reopened the same way. The tests run each of these cases against a local stand-in for
+  versions 1, 2 and 3 of Rabel's API.
