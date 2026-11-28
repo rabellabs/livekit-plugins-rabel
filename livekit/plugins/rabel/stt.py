@@ -37,7 +37,11 @@ The rules, applied to the inner speech-to-text's events while a guess of Bell's 
   5. An early start (preflight) of the inner speech-to-text whose words equal the guess, written as the guess is (the
      string LiveKit remembers for the guess), is held back; any other is passed and replaces the guess. Written
      otherwise (a comma, a number) it passes: LiveKit compares the final with the early start's string, not its words,
-     and would start again at a final written as the speech-to-text writes it.
+     and would start again at a final written as the speech-to-text writes it. With turns ended by the speech-to-text
+     (`turn_detection="stt"`) it is held written otherwise too, once this call's speech-to-text has ended a turn with
+     its final before its end of speech (Deepgram Flux, AssemblyAI) and has never sent a final after it (OpenAI's local
+     VAD): LiveKit then compares a final as a string only after the end of speech, and keeps the running reply at its
+     commit by words.
   6. Nothing is sent past the session's limits for preemptive generation (`max_retries`, 3 by default, and
      `max_speech_duration`, 10 s by default; the session's own values are read, the agent's over the session's, and
      LiveKit's defaults are used when there is no job to read them from): one guess alive at a time (one guess a turn
@@ -650,6 +654,12 @@ class SpeechStream(stt.RecognizeStream):
         self._lk_starts = 0
         # LiveKit's `_stt_turn_ended`: the speech-to-text has ended speech since it last started it
         self._lk_stt_ended = False
+        # rule 5, learned from this call's turns as `_form` learns its writing: the speech-to-text has ended a turn with
+        # its final before its end of speech (Deepgram Flux, AssemblyAI), and it has sent a final after its end of
+        # speech or ended speech on words not yet final (OpenAI's realtime models with local VAD), which ends the first
+        # for the call
+        self._finals_first = False
+        self._finals_late = False
         # how this call's speech-to-text has written its final transcripts, for a guess in a language other than English
         self._form = CallForm()
         # what this stream's guesses did for the host, for the summary logged when it closes (numbers only)
@@ -787,7 +797,10 @@ class SpeechStream(stt.RecognizeStream):
             self._lk_stt_ended = True
             if self._turn is not None and self._turn.shown:
                 self._turn.speech_ended = True
+                self._finals_late = True  # rule 5: its final comes after the end of speech
             else:
+                if self._turn is not None and self._turn.committed:
+                    self._finals_first = True  # rule 5: the turn's final came first
                 self._end_turn()
             return [ev]
         if ev.type not in (T.INTERIM_TRANSCRIPT, T.PREFLIGHT_TRANSCRIPT, T.FINAL_TRANSCRIPT):
@@ -803,6 +816,8 @@ class SpeechStream(stt.RecognizeStream):
         t.last_alt = alt
 
         if ev.type == T.FINAL_TRANSCRIPT:
+            if self._lk_stt_ended:
+                self._finals_late = True  # rule 5: a final after the end of speech
             try:
                 self._form.final(text)
             except Exception:  # noqa: BLE001 -- the form is read only for another language's guess
@@ -816,7 +831,13 @@ class SpeechStream(stt.RecognizeStream):
             # LiveKit's own comparison at the final (audio_recognition, 1.8.13): its turn's text with this final against
             # its remembered early-start text, as strings; when they differ it starts its own early reply on the final,
             # and the reply started on Bell's guess is replaced
-            lk_unchanged = self._lk_same(text, pre)
+            lim = _host_limits()
+            # LiveKit may start an early reply on a final: at any final with VAD or turn-detector endpointing, only
+            # after the speech-to-text's end of speech with its endpointing
+            on_final = not lim.stt_turns or self._lk_stt_ended
+            # a final LiveKit makes no comparison at leaves the running reply, which LiveKit keeps at its commit when
+            # the words are the same (agent_activity: `_transcripts_equivalent`)
+            lk_unchanged = self._lk_same(text, pre) or not on_final
             self._lk_has_text = True
             # the report: Bell's guess is kept when it is the running early start as the final words arrive, they equal
             # it, and the final leaves LiveKit's remembered text (the guess's) unchanged by LiveKit's own comparison
@@ -824,10 +845,6 @@ class SpeechStream(stt.RecognizeStream):
             t.final_kept = t.live is not None and t.words == t.live and lk_unchanged
             if t.final_kept and t.sent_at is not None:
                 t.head_start_ms = _ms(t.final_at - t.sent_at)
-            lim = _host_limits()
-            # LiveKit may start an early reply on a final: at any final with VAD or turn-detector endpointing, only
-            # after the speech-to-text's end of speech with its endpointing
-            on_final = not lim.stt_turns or self._lk_stt_ended
             out = [ev]
             if self._lk_pre_stale and pre is not None and text.strip() == pre.strip():
                 # rule 7: LiveKit still remembers the cancelled guess's text, finds this final unchanged and would start
@@ -874,14 +891,19 @@ class SpeechStream(stt.RecognizeStream):
         self._send_heard(t, text, ev)
 
         if ev.type == T.PREFLIGHT_TRANSCRIPT:
-            if t.live is not None and w == t.live and self._lk_same(text, self._lk_pre):
+            lim = _host_limits()
+            if (
+                t.live is not None
+                and w == t.live
+                and (self._lk_same(text, self._lk_pre) or self._words_kept(lim))
+            ):
                 # rule 5: the reply for these words is already running, and LiveKit already remembers this early start's
-                # string. Written otherwise (a comma, a number), it passes: LiveKit compares the final with that string,
-                # not its words, and would start again at a final written as the speech-to-text writes it
+                # string, or will compare only words. In any other case, written otherwise (a comma, a number), it
+                # passes: LiveKit compares the final with that string, not its words, and would start again at a final
+                # written as the speech-to-text writes it
                 self._count("eager_held_back")
                 t.held = None
                 return []
-            lim = _host_limits()
             if t.bell_sent and t.running is not None and self._lk_starts >= lim.max_starts:
                 # rule 9: no early start is left (Bell's guess took one); LiveKit would cancel the running reply and start
                 # none, so the reply under way is left to run
@@ -952,6 +974,19 @@ class SpeechStream(stt.RecognizeStream):
         self._count("guess_cancelled_by_words")  # rule 4
         t.live = t.running = None
         return [ev]
+
+    def _words_kept(self, lim: _HostLimits) -> bool:
+        """Rule 5: LiveKit will compare only the words of the turn's final with the running reply. With turns ended by
+        the speech-to-text it compares a final as a string only after the speech-to-text's end of speech
+        (audio_recognition: `_stt_turn_ended`), and at its commit it keeps the running reply by words (agent_activity:
+        `_transcripts_equivalent`). That holds while this call's speech-to-text sends its finals first: it has done so
+        in a turn, has never sent one after its end of speech, and has not ended speech in this turn yet."""
+        return (
+            lim.stt_turns
+            and self._finals_first
+            and not self._finals_late
+            and not self._lk_stt_ended
+        )
 
     def _lk_same(self, text: str, pre: str | None) -> bool:
         """LiveKit's text built on `text` is the string it remembers for the early start `pre` (None: none since the
