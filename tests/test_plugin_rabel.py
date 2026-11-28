@@ -2648,16 +2648,16 @@ async def test_the_count_runs_until_livekit_commits(committed, sent):
         assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
 
 
-async def test_the_count_starts_again_at_a_commit_with_the_conversation_not_forwarded(monkeypatch):
+@pytest.mark.parametrize("whose", ["session", "agent", "another_session"])
+async def test_the_count_starts_again_at_its_own_sessions_commit_with_the_conversation_not_forwarded(
+    whose, monkeypatch
+):
     # with `forward_chat_context` off LiveKit hands the speech-to-text no conversation item (agent_activity), so the
-    # commit is seen on the session's own event, which it emits either way
-    from livekit.agents import AgentSession
+    # commit is seen on the session's own event, which it emits either way. It is heard only when the job's primary
+    # session uses this wrapper (its own, or its running agent's): in a job with two sessions, another session's commit
+    # must not start this stream's count again, or a guess would take the early start this session's final needs
+    from livekit.agents import Agent, AgentSession
 
-    session = AgentSession(
-        turn_handling={"preemptive_generation": {"max_retries": 4}},
-        stt_context_options={"forward_chat_context": False},
-    )
-    in_session(monkeypatch, session)
     said = "I'd like to check my savings."
     script = [
         ev(0.00, T.START_OF_SPEECH),
@@ -2671,14 +2671,34 @@ async def test_the_count_starts_again_at_a_commit_with_the_conversation_not_forw
         ev(1.40, T.FINAL_TRANSCRIPT, "And my card."),
         ev(1.40, T.END_OF_SPEECH),
     ]
-    # LiveKit commits the first turn 0.7 s into the script, which starts 0.2 s in
-    asyncio.get_running_loop().call_later(
-        0.9, session.emit, "conversation_item_added", user_item(said)
-    )
     answers = {"I'd like to check": "i'd like to check my balance", "and my": "and my card"}
-    out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
-    assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
-    assert "guess_held_while_livekit_waits" not in counts
+    api = FakeAPI(answers=answers, v=3)
+    runner, url = await serve(api)
+    try:
+        async with aiohttp.ClientSession() as http:
+            w = rabel.STT(ScriptedSTT(script), api_key="test", base_url=url, http_session=http)
+            session = AgentSession(
+                stt=w if whose == "session" else ScriptedSTT([]),
+                turn_handling={"preemptive_generation": {"max_retries": 4}},
+                stt_context_options={"forward_chat_context": False},
+            )
+            if whose == "agent":
+                monkeypatch.setattr(session, "_agent", Agent(instructions="x", stt=w))
+            in_session(monkeypatch, session)
+            # the primary session commits a turn 0.7 s into the script, which starts 0.2 s in
+            asyncio.get_running_loop().call_later(
+                0.9, session.emit, "conversation_item_added", user_item(said)
+            )
+            await collect(w, wait_ready=w)
+            counts = next(iter(w._streams)).counts
+    finally:
+        await runner.cleanup()
+    if whose == "another_session":
+        # the count runs on: a wrong guess and LiveKit's start at the first final leave two, and a guess would leave one
+        assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+    else:
+        assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
+        assert "guess_held_while_livekit_waits" not in counts
 
 
 async def test_with_one_early_start_a_turn_bell_sends_no_guess(monkeypatch):

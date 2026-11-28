@@ -354,22 +354,37 @@ def _host_limits() -> _HostLimits:
         return _DEFAULT_LIMITS
 
 
-def _watch_commits(on_item: Callable[[Any], None]) -> Callable[[], None] | None:
+def _session_stt(session: Any) -> Any:
+    """The speech-to-text the session's running agent uses, as LiveKit picks it (agent_activity: the agent's own, else
+    the session's)."""
+    try:
+        agent = session.current_agent
+    except RuntimeError:  # the session is not running an agent yet
+        agent = None
+    own = getattr(agent, "stt", NOT_GIVEN) if agent is not None else NOT_GIVEN
+    return own if utils.is_given(own) else session.stt
+
+
+def _watch_commits(wrapper: Any, on_item: Callable[[Any], None]) -> Callable[[], None] | None:
     """LiveKit's commit, where LiveKit does not hand it to the speech-to-text.
 
     Rules 6 and 8 see LiveKit's commit by the caller's message added to the conversation, which LiveKit forwards to the
     speech-to-text only with the session's `stt_context_options["forward_chat_context"]` on, its default
     (agent_activity). With it off, `on_item` listens to the session's own `conversation_item_added`, which LiveKit emits
-    either way. Returns how to stop listening, or None when nothing listens (forwarded, or no session)."""
+    either way. The job's primary session is the only one the plugin can reach, so it listens only when that session's
+    speech-to-text is `wrapper`: in a job with two sessions another session's commit would start this stream's count
+    again, and a guess could take the early start its final needs. Returns how to stop listening, or None when nothing
+    listens (forwarded, no session, or another session's speech-to-text; LiveKit's count is then never seen to start
+    again: fewer guesses, none later)."""
     try:
         ctx = get_job_context(required=False)
         if ctx is None:
             return None
         session = ctx.primary_session
         forward = session.options.stt_context_options.get("forward_chat_context", True)
+        if forward is not False or _session_stt(session) is not wrapper:
+            return None
     except Exception:  # noqa: BLE001 -- no session started for this job
-        return None
-    if forward is not False:
         return None
     try:
         session.on("conversation_item_added", on_item)
@@ -721,7 +736,9 @@ class SpeechStream(stt.RecognizeStream):
                     f"Bell: could not start ({e!r}); the speech-to-text passes through unchanged"
                 )
                 self._bell = None
-        unwatch = _watch_commits(self._on_session_item) if self._bell is not None else None
+        unwatch = (
+            _watch_commits(self._rstt, self._on_session_item) if self._bell is not None else None
+        )
         tasks = [
             asyncio.create_task(_forward_input(stream), name="rabel.SpeechStream.forward_input"),
             asyncio.create_task(_forward_output(stream), name="rabel.SpeechStream.forward_output"),
