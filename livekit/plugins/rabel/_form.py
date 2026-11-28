@@ -31,7 +31,8 @@ Those rules are English. For any other language the guess is written from what t
 `written`): each added word as the speech-to-text last wrote it in this call, and the turn closed the way this call's
 final transcripts have closed after the same opening word, or the way most of them have closed. Nothing about the
 language is assumed. Until the call has had a final transcript there is nothing to copy, and the guess is written as
-above.
+above, except that added words of a script written without spaces (kana, ideographs, Thai) are joined without them and
+the turn is not closed with ".": after kana or an ideograph with "。", else with no mark.
 """
 
 from __future__ import annotations
@@ -109,6 +110,12 @@ def final_form(shown: str, added: tuple[str, ...]) -> str:
     shown = shown.strip()
     if not added:
         return shown
+    if unspaced(added):
+        # a script written without spaces (kana, ideographs, Thai): no English rule applies, the added words are joined
+        # without spaces, and the turn closed with the ideographic full stop after kana or an ideograph, else with no
+        # mark (Thai writes none)
+        toks = (shown.split() if shown else []) + list(added)
+        return _join(toks, len(added)) + ("。" if _ideographic(added[-1][-1:]) else "")
     words = [_form(w) for w in added]
     before = [norm_word(t) for t in shown.split()[-1:]] + list(added)
     for i, w in enumerate(added):  # "five pm" -> "five PM": the hour's mark, after a number
@@ -153,7 +160,8 @@ def _opener(toks: list[str]) -> str:
 
 class CallForm:
     """How this call's speech-to-text has written its final transcripts: each word's written form, whether a sentence
-    opens with a capital, and how a turn closes (its last marks, by the sentence's opening word and over all)."""
+    opens with a capital, how a turn closes (its last marks, by the sentence's opening word and over all), and whether a
+    space stands where a script written without spaces meets a spaced one."""
 
     def __init__(self) -> None:
         self._surface: dict[str, str] = {}
@@ -162,6 +170,8 @@ class CallForm:
         self._capital = (
             0  # final transcripts that opened with a capital, less those that opened without
         )
+        # meetings of a script without spaces and a spaced one written with a space, less those written without
+        self._script_gap = 0
 
     def final(self, text: str) -> None:
         """A final transcript, as the speech-to-text wrote it."""
@@ -188,6 +198,17 @@ class CallForm:
                     b -= 1
                 self._surface[w[0]] = tok[a:b]
             opens = tok.endswith(_ANY_ENDS)
+        prev, gap = "", False
+        for c in text:
+            if c.isspace():
+                gap = True
+                continue
+            if not c.isalnum():  # a mark between them: no meeting of the two scripts
+                prev, gap = "", False
+                continue
+            if prev and _unspaced(prev) != _unspaced(c):
+                self._script_gap += 1 if gap else -1
+            prev, gap = c, False
 
     def end_after(self, opener: str) -> str | None:
         """How a turn has closed after this opening word, else how most turns have closed; None before any final."""
@@ -201,6 +222,12 @@ class CallForm:
     def capitals(self) -> bool:
         return self._capital >= 0
 
+    @property
+    def spaces_scripts(self) -> bool:
+        """A space where a script without spaces meets a spaced one, as most of this call's finals have written it; none
+        before any final has shown one."""
+        return self._script_gap > 0
+
 
 def _unspaced(c: str) -> bool:
     """A character of a script written without spaces between words, which LiveKit's comparison takes one character at a
@@ -208,15 +235,29 @@ def _unspaced(c: str) -> bool:
     return not c.isspace() and len(split_words(c + c, split_character=True)) == 2
 
 
-def _join(toks: list[str], n_added: int) -> str:
+def unspaced(words: tuple[str, ...]) -> bool:
+    """Bell's added words are of a script written without spaces (an English word never is)."""
+    return any(_unspaced(c) for w in words for c in w)
+
+
+def _ideographic(c: str) -> bool:
+    """Kana or an ideograph: Japanese and Chinese close a sentence with the ideographic full stop."""
+    return unicodedata.name(c, "").startswith(
+        ("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH", "HIRAGANA", "KATAKANA")
+    )
+
+
+def _join(toks: list[str], n_added: int, spaces_scripts: bool = False) -> str:
     """The tokens joined as the speech-to-text writes them: the shown ones with a space between, as before, and each of
-    the last `n_added` (Bell's added words) after a space unless the text before it or the word itself is in a script
-    written without spaces."""
+    the last `n_added` (Bell's added words) after a space between two words of spaced scripts, none between two of a
+    script written without spaces, and where the two meet as `spaces_scripts` says."""
     shown = " ".join(toks[: len(toks) - n_added])
     out = shown
     for w in toks[len(toks) - n_added :]:
-        if out and not (_unspaced(out[-1]) or _unspaced(w[:1])):
-            out += " "
+        if out:
+            before, after = _unspaced(out[-1]), _unspaced(w[:1])
+            if spaces_scripts if before != after else not before:
+                out += " "
         out += w
     return out
 
@@ -234,4 +275,4 @@ def written(shown: str, added: tuple[str, ...], form: CallForm) -> str:
         return final_form(shown, added)  # no final transcript in this call yet: nothing to copy
     if form.capitals and (not shown or shown.endswith(_ANY_ENDS)):
         toks[len(toks) - len(words)] = _cap(words[0])
-    return _join(toks, len(words)) + end
+    return _join(toks, len(words), form.spaces_scripts) + end

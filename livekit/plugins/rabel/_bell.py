@@ -55,14 +55,26 @@ _BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 _MAX_RETRY_AFTER_S = 300.0
 # A conversation that was open this long and then closed cleanly (the API closes one after an hour) reopens at once.
 _LONG_CONVERSATION_S = 60.0
+# The back-off starts again only after a conversation that stayed up this long after its ready, so an API that sends
+# ready and then closes is reopened on the growing waits, not every second.
+_STEADY_S = 30.0
 # One timeout from opening the connection until the API's ready; past it the attempt counts as a timeout and is retried.
 _OPEN_TIMEOUT_S = 2.0
+# How long closing the WebSocket waits for the API's close frame.
+_WS_CLOSE_S = 2.0
 # Bell sends nothing while it has no guess, so a quiet line is normal. The connection is watched with LiveKit's
 # WebSocketMonitor: after a third of this with nothing received it pings, and if no pong or message comes back within
 # this time the connection counts as dead (a half-open socket) and the conversation is reopened on the back-off. The
 # Rabel API answers pings in its WebSocket server, not in the conversation's code, so a healthy quiet call always
 # answers in time.
 _LIVENESS_TIMEOUT_S = 15.0
+
+
+def _ws_timeout() -> Any:
+    """The close wait as the installed aiohttp takes it: a ClientWSTimeout from aiohttp 3.11, a number of seconds before
+    (livekit-agents allows aiohttp 3.10)."""
+    ws_timeout = getattr(aiohttp, "ClientWSTimeout", None)
+    return _WS_CLOSE_S if ws_timeout is None else ws_timeout(ws_close=_WS_CLOSE_S)
 
 
 def _backoff(attempt: int) -> float:
@@ -206,7 +218,7 @@ class BellConnection:
                 await self._session.close()
 
     async def _run(self) -> None:
-        attempt = 0  # failed attempts since the last conversation that reached ready
+        attempt = 0  # failed attempts since the last conversation that stayed up
         while not self._closed:
             opened_at: float | None = None
             refusal: dict[str, Any] | None = None
@@ -234,7 +246,7 @@ class BellConnection:
                     self._out.get_nowait()
             if self._closed:
                 return
-            if opened_at is not None:
+            if opened_at is not None and time.monotonic() - opened_at >= _STEADY_S:
                 attempt = 0
             wait = self._wait_after(attempt, opened_at, refusal, clean)
             if wait is None:
@@ -304,7 +316,7 @@ class BellConnection:
         ws = await asyncio.wait_for(
             self._session.ws_connect(
                 ws_url,
-                timeout=aiohttp.ClientWSTimeout(ws_close=2.0),
+                timeout=_ws_timeout(),
                 heartbeat=None,
                 autoping=False,
                 max_msg_size=1 << 20,

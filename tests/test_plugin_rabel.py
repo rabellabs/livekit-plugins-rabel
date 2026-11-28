@@ -591,6 +591,33 @@ async def test_no_reopen_after_400():
     assert len(at) == 1, at
 
 
+@pytest.mark.parametrize("has_ws_timeout", [True, False], ids=["aiohttp-3.11", "aiohttp-3.10"])
+async def test_the_close_timeout_is_given_as_the_installed_aiohttp_takes_it(
+    has_ws_timeout, monkeypatch
+):
+    # livekit-agents allows aiohttp 3.10, which has no ClientWSTimeout and takes the close handshake's wait as a number
+    # of seconds
+    want = aiohttp.ClientWSTimeout(ws_close=2.0) if has_ws_timeout else 2.0
+    if not has_ws_timeout:
+        monkeypatch.delattr(aiohttp, "ClientWSTimeout")
+    seen = []
+
+    class Recording(aiohttp.ClientSession):
+        def ws_connect(self, url, **kw):
+            seen.append(kw.get("timeout"))
+            return super().ws_connect(url, **kw)
+
+    runner, url = await serve(FakeAPI(answers=GUESS_AT_CHECK, v=3))
+    try:
+        async with Recording() as http:
+            w = rabel.STT(ScriptedSTT(TURN), api_key="test", base_url=url, http_session=http)
+            out = await collect(w, wait_ready=w)
+    finally:
+        await runner.cleanup()
+    assert out != await plain_run(TURN)  # Bell's guess was sent
+    assert seen == [want]
+
+
 async def test_not_ready_within_the_open_timeout_retries(monkeypatch, caplog):
     import livekit.plugins.rabel._bell as bell
 
@@ -614,6 +641,34 @@ async def test_clean_close_reopens_at_once_only_after_a_long_conversation(
     api = FakeAPI(v=2, close_after=0.4)
     at = await _reopen_run(api)
     assert len(at) >= 2 and reopen_at[0] <= at[1] <= reopen_at[1], at
+
+
+@pytest.mark.parametrize(
+    "up_for, waits", [(0.0, [0.2, 0.4, 0.8, 1.6]), (0.6, [0.2, 0.2])], ids=["at-once", "stayed-up"]
+)
+async def test_an_api_that_closes_after_ready_is_reopened_on_the_growing_back_off(
+    up_for, waits, monkeypatch
+):
+    # an API that sends ready and closes at once is reopened on the growing waits, not each time after the first one;
+    # the back-off starts again only after a conversation that stayed up (30 s, with waits of 1, 2, 4, 8 s; here 0.5 s,
+    # with waits of 0.2, 0.4, 0.8, 1.6 s)
+    import livekit.plugins.rabel._bell as bell
+
+    monkeypatch.setattr(bell, "_BACKOFF_S", (0.2, 0.4, 0.8, 1.6, 3.2, 6.0))
+    monkeypatch.setattr(bell, "_STEADY_S", 0.5)
+    api = FakeAPI(v=3, close_after=up_for)
+    runner, url = await serve(api)
+    try:
+        async with aiohttp.ClientSession() as http:
+            w = rabel.STT(ScriptedSTT(TURN), api_key="test", base_url=url, http_session=http)
+            out = await collect(w, settle=3.5, wait_ready=w)
+    finally:
+        await runner.cleanup()
+    assert out == await plain_run(TURN)
+    at = api.connected_at
+    gaps = [b - a - up_for for a, b in zip(at[:-1], at[1:], strict=True)]
+    assert len(gaps) >= len(waits), gaps
+    assert all(abs(g - w) < 0.15 for g, w in zip(gaps[: len(waits)], waits, strict=True)), gaps
 
 
 LATE_TURN = [(at + 2.0, *rest) for at, *rest in TURN]  # a turn after 2 s of a quiet line
@@ -667,6 +722,35 @@ async def test_contradicting_interim_passes_and_eager_replaces():
     assert counts["guess_cancelled_by_words"] == 1
 
 
+@pytest.mark.parametrize(
+    "eager, held", [("Yes please do.", True), ("Yes, please do.", False)], ids=["same", "other"]
+)
+async def test_the_speech_to_texts_early_start_on_the_guess_is_held_only_as_the_same_string(
+    eager, held
+):
+    # LiveKit remembers the early start's string and, with VAD or turn-detector endpointing, starts again at a final
+    # that is another string (audio_recognition: transcript_changed). The speech-to-text's own early start on the
+    # guess's words written otherwise (a comma) passes, so LiveKit holds the string its final will have, as without Bell
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "Yes", 0.95),
+        ev(0.40, T.PREFLIGHT_TRANSCRIPT, eager, 0.95),
+        ev(0.90, T.FINAL_TRANSCRIPT, eager),
+        ev(0.90, T.END_OF_SPEECH),
+    ]
+    out, counts = await wrapped_run(script, FakeAPI(answers={"Yes": "yes please do"}, v=3))
+    passed = [] if held else [(T.PREFLIGHT_TRANSCRIPT, eager)]
+    assert out == [
+        (T.START_OF_SPEECH, None),
+        (T.INTERIM_TRANSCRIPT, "Yes"),
+        (T.PREFLIGHT_TRANSCRIPT, "Yes please do."),
+        *passed,
+        (T.FINAL_TRANSCRIPT, eager),
+        (T.END_OF_SPEECH, None),
+    ]
+    assert counts["guess_sent"] == 1 and counts.get("eager_held_back", 0) == int(held)
+
+
 # rule 7: a final with exactly the text of a guess the words cancelled is passed first as an early start on its own
 # words (LiveKit remembers the guess's text until the next final and starts no early reply at a final equal to it)
 STALE_GUESS = {"check my": "check my balance"}
@@ -693,9 +777,17 @@ STALE_GUESS = {"check my": "check my balance"}
         pytest.param([], "check my balance.", False, id="guess-still-live-its-reply-waits"),
     ],
 )
+@pytest.mark.parametrize("turn_detection", [None, "stt"])
 async def test_final_equal_to_a_cancelled_guess_goes_first_as_an_early_start(
-    middle, final, re_sent
+    middle, final, re_sent, turn_detection, monkeypatch
 ):
+    # With the speech-to-text's own endpointing the final comes before its end of speech (Deepgram Flux), where LiveKit
+    # starts no early reply on a final but does on an early start, so the final still goes first as one
+    if turn_detection is not None:
+        in_session(
+            monkeypatch,
+            session_with(turn_detection=turn_detection, preemptive_generation={"max_retries": 4}),
+        )
     script = [ev(0.00, T.START_OF_SPEECH), ev(0.05, T.INTERIM_TRANSCRIPT, "check my", 0.95)]
     at = 0.30
     for text, conf in middle:
@@ -769,25 +861,42 @@ async def test_guess_held_while_livekits_own_reply_waits(commit_at, sent, count)
         assert out == [(typ, text) for _, typ, text, _ in [*BEFORE, *AFTER]]
 
 
-async def test_held_guess_refused_when_the_stts_own_early_start_replaces_livekits_reply():
-    # rule 8 takes the held guess again at the speech-to-text's own early start; LiveKit has made two starts since its
-    # last commit (its own at the first final, the speech-to-text's), so rule 6 refuses the guess (no spare start
-    # after it), and the events are the speech-to-text's
+async def test_a_guess_held_while_livekits_reply_waits_is_not_sent_after_the_stts_early_start():
+    # the speech-to-text's own early start replaces LiveKit's waiting reply; a guess now would cancel that start (rule
+    # 6), so the held guess is dropped and the events pass unchanged
     script = [
         *BEFORE,
-        ev(0.60, T.START_OF_SPEECH),
-        ev(0.65, T.INTERIM_TRANSCRIPT, "and my", 0.95),
-        ev(
-            0.85, T.PREFLIGHT_TRANSCRIPT, "And my", 0.95
-        ),  # replaces LiveKit's waiting reply, as without Bell
-        ev(1.10, T.INTERIM_TRANSCRIPT, "and my savings", 0.95),
-        ev(1.30, T.FINAL_TRANSCRIPT, "And my savings please."),
-        ev(1.30, T.END_OF_SPEECH),
+        *AFTER[:2],
+        ev(0.80, T.PREFLIGHT_TRANSCRIPT, "and my", 0.95),
+        *AFTER[2:],
     ]
-    out, counts = await wrapped_run(script, FakeAPI(answers=SAVINGS, v=2))
+    out, counts = await wrapped_run(script, FakeAPI(answers=SAVINGS, v=3))
     assert out == await plain_run(script)
-    assert counts["guess_held_while_livekit_waits"] == 1 and counts["guess_no_spare_start"] == 1
-    assert "guess_sent" not in counts
+    assert counts["guess_held_while_livekit_waits"] == 1 and "guess_sent" not in counts
+    assert counts["held_guess_not_sent_turn_over"] == 1
+
+
+@pytest.mark.parametrize("why", ["agent-speaking", "past-the-limit-of-speech"])
+async def test_a_final_livekit_starts_no_early_reply_on_holds_no_later_guess(why, monkeypatch):
+    # BEFORE's final comes while the agent speaks (a backchannel LiveKit trims, a turn it drops by `min_words`) or past
+    # `max_speech_duration`: LiveKit starts no early reply on it, so none waits for a commit, and some such turns are
+    # never committed. The next turn's guess is sent
+    opts = {"max_retries": 4}
+    if why == "past-the-limit-of-speech":
+        opts["max_speech_duration"] = 0.2
+    session = session_like(session_with(preemptive_generation=opts))
+    if why == "agent-speaking":
+        import types
+
+        session.current_speech = types.SimpleNamespace(interrupted=False)
+        # the agent's reply ends between the turns (0.45 s into the script, which starts 0.2 s in)
+        asyncio.get_running_loop().call_later(0.65, setattr, session, "current_speech", None)
+    in_session(monkeypatch, session)
+    out, counts = await wrapped_run([*BEFORE, *AFTER], FakeAPI(answers=SAVINGS, v=3))
+    assert [e for e in out if e[0] == T.PREFLIGHT_TRANSCRIPT] == [
+        (T.PREFLIGHT_TRANSCRIPT, "and my savings please.")
+    ]
+    assert "guess_held_while_livekit_waits" not in counts
 
 
 async def test_no_hold_after_a_final_livekit_found_unchanged_from_a_version_2_api():
@@ -1669,14 +1778,15 @@ async def test_eager_off_flux_words_as_interims_reach_neither_new_rule():
 async def test_part_words_and_the_services_own_early_start():
     # a service that shows a word while it is said: interims whose last word is a beginning of the guess's word agree with
     # the guess and are held back (rule 2, the part-word); when a message leaves only final words, the plugin makes its own
-    # early start, which on the guess's words is held back (rule 5); the turn's end gives the final.
+    # early start, which on the guess's words, written as the guess is, is held back (rule 5); the turn's end gives the
+    # final.
     script = [
         ev(0.00, T.START_OF_SPEECH),
         ev(0.05, T.INTERIM_TRANSCRIPT, "Can I", 0.95),
         ev(0.15, T.INTERIM_TRANSCRIPT, "Can I chan", 0.95),
         ev(0.25, T.INTERIM_TRANSCRIPT, "Can I change my", 0.95),
         ev(0.35, T.INTERIM_TRANSCRIPT, "Can I change my add", 0.95),
-        ev(0.45, T.PREFLIGHT_TRANSCRIPT, "Can I change my address", 0.95),
+        ev(0.45, T.PREFLIGHT_TRANSCRIPT, "Can I change my address?", 0.95),
         ev(0.55, T.FINAL_TRANSCRIPT, "Can I change my address?"),
         ev(0.55, T.END_OF_SPEECH),
     ]
@@ -1745,14 +1855,15 @@ async def test_burst_with_the_services_early_end_then_resume():
 
 async def test_services_early_end_on_bells_live_guess_then_resume():
     # Bell's guess is live before the burst: the burst's beginning is held back (rule 2), the service's early end on the
-    # guess's words is held back (rule 5); the resume's interim of the same words passes; the update after it moves past the
-    # guess and is passed, which cancels it (rule 4); the service's next early end is passed as the early start.
+    # guess's words, written as the guess is, is held back (rule 5); the resume's interim of the same words passes; the
+    # update after it moves past the guess and is passed, which cancels it (rule 4); the service's next early end is
+    # passed as the early start.
     script = [
         ev(0.00, T.START_OF_SPEECH),
         ev(0.05, T.INTERIM_TRANSCRIPT, "Can you", 0.95),
         ev(0.20, T.INTERIM_TRANSCRIPT, "Can you tell me", 0.95),
         ev(0.22, T.INTERIM_TRANSCRIPT, "Can you tell me my balance", 0.95),
-        ev(0.23, T.PREFLIGHT_TRANSCRIPT, "Can you tell me my balance", 0.95),  # its early end
+        ev(0.23, T.PREFLIGHT_TRANSCRIPT, "Can you tell me my balance?", 0.95),  # its early end
         ev(0.30, T.INTERIM_TRANSCRIPT, "Can you tell me my balance", 0.95),  # its resume
         ev(0.40, T.INTERIM_TRANSCRIPT, "Can you tell me my balance please", 0.95),
         ev(0.45, T.PREFLIGHT_TRANSCRIPT, "Can you tell me my balance please", 0.95),
@@ -2394,6 +2505,20 @@ def session_with(**turn_handling):
     return AgentSession(turn_handling=turn_handling)
 
 
+def session_like(session, **kw):
+    """What the plugin reads of a session, with the parts a test sets (an agent, its reply under way)."""
+    import types
+
+    base = {
+        "options": session.options,
+        "turn_detection": session.turn_detection,
+        "llm": None,
+        "current_agent": None,
+        "current_speech": None,
+    }
+    return types.SimpleNamespace(**{**base, **kw})
+
+
 @pytest.mark.livekit_default
 async def test_the_sessions_settings_are_read_and_the_agents_come_first(monkeypatch):
     import types
@@ -2521,6 +2646,40 @@ async def test_the_count_runs_until_livekit_commits(committed, sent):
         assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
     else:
         assert counts["guess_sent"] == 1 and counts["guess_no_spare_start"] == 1
+
+
+async def test_the_count_starts_again_at_a_commit_with_the_conversation_not_forwarded(monkeypatch):
+    # with `forward_chat_context` off LiveKit hands the speech-to-text no conversation item (agent_activity), so the
+    # commit is seen on the session's own event, which it emits either way
+    from livekit.agents import AgentSession
+
+    session = AgentSession(
+        turn_handling={"preemptive_generation": {"max_retries": 4}},
+        stt_context_options={"forward_chat_context": False},
+    )
+    in_session(monkeypatch, session)
+    said = "I'd like to check my savings."
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, "I'd like to check", 0.95),
+        ev(0.30, T.INTERIM_TRANSCRIPT, "I'd like to check my savings", 0.95),
+        ev(0.50, T.FINAL_TRANSCRIPT, said),
+        ev(0.50, T.END_OF_SPEECH),
+        ev(0.90, T.START_OF_SPEECH),
+        ev(0.95, T.INTERIM_TRANSCRIPT, "and my", 0.95),
+        ev(1.20, T.INTERIM_TRANSCRIPT, "and my card", 0.95),
+        ev(1.40, T.FINAL_TRANSCRIPT, "And my card."),
+        ev(1.40, T.END_OF_SPEECH),
+    ]
+    # LiveKit commits the first turn 0.7 s into the script, which starts 0.2 s in
+    asyncio.get_running_loop().call_later(
+        0.9, session.emit, "conversation_item_added", user_item(said)
+    )
+    answers = {"I'd like to check": "i'd like to check my balance", "and my": "and my card"}
+    out, counts = await wrapped_run(script, FakeAPI(answers=answers, v=3))
+    assert counts["guess_sent"] == 2 and "guess_no_spare_start" not in counts
+    assert "guess_held_while_livekit_waits" not in counts
+
 
 async def test_with_one_early_start_a_turn_bell_sends_no_guess(monkeypatch):
     # `max_retries` 1: a guess would take the turn's only early start; were it wrong, LiveKit could start none on the
@@ -2705,6 +2864,90 @@ def test_a_script_without_spaces_gets_none_between_the_added_words():
     fr = CallForm()
     fr.final("Je voudrais un billet.")
     assert written("Je voudrais", ("un", "billet"), fr) == "Je voudrais un billet."
+
+
+JA_SHOWN = "\u6b8b\u9ad8\u3092"
+JA_SAID = "\u6b8b\u9ad8\u3092\u78ba\u8a8d\u3002"
+
+
+@pytest.mark.parametrize("language", ["ja", "", "multi"])
+async def test_a_script_without_spaces_is_written_without_them_before_any_final(language):
+    # in the call's first turn there is no final to copy, and a speech-to-text that names no one language is written by
+    # the English rules; Bell's added words of a script written without spaces are still joined without them, and
+    # closed with the ideographic full stop, not "."
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.05, T.INTERIM_TRANSCRIPT, JA_SHOWN, 0.95),
+        ev(0.40, T.FINAL_TRANSCRIPT, JA_SAID),
+        ev(0.40, T.END_OF_SPEECH),
+    ]
+    out, ends = await run_in(language, script, FakeAPI(answers={JA_SHOWN: JA_SAID[:-1]}, v=3))
+    assert [text for typ, text in out if typ == T.PREFLIGHT_TRANSCRIPT] == [JA_SAID]
+    assert ends[-1]["guess"] == "kept"
+
+
+@pytest.mark.parametrize("language", ["ja", "", "multi"])
+async def test_a_script_without_spaces_is_written_as_the_calls_finals_whatever_language_is_named(
+    language,
+):
+    # a speech-to-text that closes its turns with no mark: from the call's first final on, Bell's added words of a
+    # script written without spaces are written as the call's finals are, also where the speech-to-text names no one
+    # language
+    shown, said = "\u53e3\u5ea7\u3092", "\u53e3\u5ea7\u3092\u958b\u8a2d"
+    script = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.30, T.FINAL_TRANSCRIPT, JA_SAID[:-1]),
+        ev(0.30, T.END_OF_SPEECH),
+        ev(0.45, COMMIT, JA_SAID[:-1]),
+        ev(0.60, T.START_OF_SPEECH),
+        ev(0.65, T.INTERIM_TRANSCRIPT, shown, 0.95),
+        ev(1.00, T.FINAL_TRANSCRIPT, said),
+        ev(1.00, T.END_OF_SPEECH),
+    ]
+    out, ends = await run_in(language, script, FakeAPI(answers={shown: said}, v=3))
+    assert [text for typ, text in out if typ == T.PREFLIGHT_TRANSCRIPT] == [said]
+    assert ends[-1]["guess"] == "kept"
+
+
+def test_a_script_without_spaces_before_any_final_and_english_as_before():
+    from livekit.plugins.rabel._form import CallForm, final_form, written
+
+    zh = ("\u6211\u60f3", ("\u67e5", "\u4f59", "\u989d"))
+    assert final_form(*zh) == written(*zh, CallForm()) == "\u6211\u60f3\u67e5\u4f59\u989d\u3002"
+    # Thai closes a turn with no mark
+    th = ("\u0e1c\u0e21", ("\u0e2d", "\u0e22", "\u0e32", "\u0e01"))
+    assert final_form(*th) == "\u0e1c\u0e21\u0e2d\u0e22\u0e32\u0e01"
+    # English guesses are written byte for byte as before (the public benchmark is English)
+    english = {
+        ("I'd like to check", ("my", "balance")): "I'd like to check my balance.",
+        ("Can I pay at", ("five", "pm")): "Can I pay at five PM?",
+        ("Yes.", ("im", "done")): "Yes. I'm done.",
+        ("what's", ("the", "time")): "what's the time?",
+        (
+            "Yes, and",
+            ("i", "want", "to", "pay", "at", "3", "pm"),
+        ): "Yes, and I want to pay at 3 PM.",
+        ("My card number is 4", ("2", "7")): "My card number is 4 2 7.",
+        ("I want", ()): "I want",
+    }
+    for (shown, added), said in english.items():
+        assert final_form(shown, added) == written(shown, added, CallForm()) == said
+
+
+@pytest.mark.parametrize("gap", [" ", ""], ids=["spaced", "unspaced"])
+def test_where_two_scripts_meet_the_space_is_written_as_the_calls_finals_write_it(gap):
+    from livekit.plugins.rabel._form import CallForm, written
+
+    # a speech-to-text may or may not put a space where a script without spaces meets a spaced one
+    # ("\u6211\u5728\u7528 iphone" or "\u6211\u5728\u7528iphone"); LiveKit compares the final's string, so the guess has
+    # the space exactly where this call's finals have had it
+    zh = CallForm()
+    zh.final(f"\u6211\u5728\u7528{gap}iphone\u3002")
+    shown = "\u6211\u60f3\u7528"
+    assert written(shown, ("chatgpt",), zh) == f"{shown}{gap}chatgpt\u3002"
+    # and from the spaced script back to the one without spaces
+    said = f"{shown}{gap}chatgpt{gap}\u5199\u3002"
+    assert written(f"{shown}{gap}chatgpt", ("\u5199",), zh) == said
 
 
 # ------------------------------------------------------------------ the end of a turn
