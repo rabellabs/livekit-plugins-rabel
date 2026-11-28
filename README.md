@@ -166,7 +166,8 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   Japanese, Chinese and Thai are the exception in the first turn: the words Bell adds are joined without spaces and
   the turn is closed with "。" after kana or an ideograph, else with no mark. These scripts are written this way also
   when your speech-to-text names no one language.
-  With `turn_detection="stt"`, LiveKit compares words and the writing does not matter.
+  With `turn_detection="stt"`, LiveKit compares words when it commits the turn, so the writing matters only for a final
+  your speech-to-text sends after its own end of speech.
 - **Lower preemptive-generation limits mean fewer guesses.** The plugin always leaves LiveKit two early starts of its
   own in a turn. With `max_retries` 4 Bell can guess twice in a turn, at LiveKit's default of 3 once, and with 2 or
   fewer it sends none. Outside a LiveKit job (a script that drives the
