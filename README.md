@@ -106,13 +106,15 @@ not read with it on.
   turn, because the guess would cancel that start's reply or take a start the speech-to-text needs next. On a turn where
   Bell's guess took one of LiveKit's early starts, the speech-to-text's own early start is held back when none is left
   and a reply is running, because LiveKit would cancel that reply and start none.
-- While Bell's guess is the running early start, the plugin holds back the interim transcripts and the speech-to-text's
-  own preflight that agree with it, because LiveKit would otherwise cancel the reply. Anything that disagrees is passed
-  and cancels the wrong reply. The final words still decide whether the reply is kept.
+- While Bell's guess is the running early start, the plugin holds back the interim transcripts that agree with it, and
+  the speech-to-text's own preflight on its words when it is written as the guess is, because LiveKit would otherwise
+  cancel the reply. Anything that disagrees is passed and cancels the wrong reply. A preflight on the same words written
+  otherwise (a comma, a number) is passed too, so LiveKit holds the string its final transcript will have. The final
+  words still decide whether the reply is kept.
 - While an early reply waits for LiveKit's end of turn (LiveKit's own, made on a final transcript, or one whose words a
   final transcript has matched), the plugin holds Bell's guess, which would replace that reply, and never sends it
-  later. The plugin sees LiveKit's end of turn through the session's `stt_context_options` `forward_chat_context`, on by
-  default. With it off, the plugin holds every guess that comes after such a reply begins to wait.
+  later. The plugin sees LiveKit's end of turn when LiveKit adds the caller's message to the conversation, with the
+  session's `stt_context_options` `forward_chat_context` on (the default) or off.
 
 So a guess never makes your agent's reply start later than it would have started without Bell.
 <!-- n:never_later_line -->In the public benchmark's run of 27 November 2026 with `livekit-plugins-rabel` 1.9.0.1 (376 scripted calls to one bank, 2,030 turns with a reply), no reply started later with Bell than without it.<!-- /n -->
@@ -161,6 +163,9 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   in the other three as in English. What differs is the writing of a guess: in a language other than English the
   plugin has nothing to copy until the call's first final transcript, so under LiveKit's own turn detection a right
   guess in a call's first turn is usually not kept, and later turns depend on how evenly your speech-to-text writes.
+  Japanese, Chinese and Thai are the exception in the first turn: the words Bell adds are joined without spaces and
+  the turn is closed with "。" after kana or an ideograph, else with no mark. These scripts are written this way also
+  when your speech-to-text names no one language.
   With `turn_detection="stt"`, LiveKit compares words and the writing does not matter.
 - **Lower preemptive-generation limits mean fewer guesses.** The plugin always leaves LiveKit two early starts of its
   own in a turn. With `max_retries` 4 Bell can guess twice in a turn, at LiveKit's default of 3 once, and with 2 or
@@ -170,7 +175,6 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   the agent, and a guess's words would count as the caller's where LiveKit counts the words needed to interrupt
   (`min_words` in `turn_handling`'s interruption options). Outside a LiveKit job the plugin cannot see the agent
   speaking; there, keep `min_words` at its default 0.
-- **Keep `forward_chat_context` on.** Off, Bell sends fewer guesses (above).
 - **While a guess is live, your live caption shows the guess.** The user transcript LiveKit shows and sends to your
   front end carries Bell's guess, not the caller's words so far, until the words move past it or the final arrives. A
   front end cannot tell the two apart. Only `enabled=False` turns this off.
@@ -187,6 +191,7 @@ reports your speech-to-text's model and provider as its own, so LiveKit's metric
   `bad_message`, 401 `bad_key`, 402 `no_seconds` or 404 `unknown_agent` ends Bell for that stream. Broken data from the
   API is ignored. A guess that comes late, under `min_chance` or after its turn has ended is dropped. With no API key, or
   `enabled=False`, no connection is opened. A conversation that closes cleanly after a minute or more (the API closes
-  one after an hour) is reopened at once; any other is reopened as when the API is down. A connection that goes silent
-  is noticed within 15 s and reopened the same way. The tests run each of these cases against a local stand-in for
-  versions 1, 2 and 3 of Rabel's API.
+  one after an hour) is reopened at once; any other is reopened as when the API is down. The waits start again from 1 s
+  only after a conversation has stayed up 30 s, so an API that sends ready and then closes is not reopened every
+  second. A connection that goes silent is noticed within 15 s and reopened the same way. The tests run each of these
+  cases against a local stand-in for versions 1, 2 and 3 of Rabel's API.
