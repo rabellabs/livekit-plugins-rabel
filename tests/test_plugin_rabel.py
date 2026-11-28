@@ -2929,9 +2929,41 @@ def test_a_script_without_spaces_before_any_final_and_english_as_before():
         ): "Yes, and I want to pay at 3 PM.",
         ("My card number is 4", ("2", "7")): "My card number is 4 2 7.",
         ("I want", ()): "I want",
+        # a name of a script written without spaces in an English sentence: the added words and the shown text they join
+        # are not all of that script, so the English rules, as before
+        ("I'd like to speak to", ("\u738b", "please")): "I'd like to speak to \u738b please.",
+        ("My name is", ("\u7530", "\u4e2d")): "My name is \u7530 \u4e2d.",
+        ("Is", ("\u6771", "\u4eac", "open")): "Is \u6771 \u4eac open?",
     }
     for (shown, added), said in english.items():
         assert final_form(shown, added) == written(shown, added, CallForm()) == said
+
+
+@pytest.mark.parametrize("after_a_final", [False, True], ids=["first_turn", "after_a_final"])
+@pytest.mark.parametrize("language", ["en", "multi"])
+async def test_english_with_a_name_of_a_script_without_spaces_is_written_by_the_english_rules(
+    language, after_a_final
+):
+    # Bell adds a name of a script written without spaces to an English sentence: the guess is written by the English
+    # rules as before, in the call's first turn and after its first final
+    said = "I'd like to speak to \u738b please."
+    first = [
+        ev(0.00, T.START_OF_SPEECH),
+        ev(0.30, T.FINAL_TRANSCRIPT, "Hello."),
+        ev(0.30, T.END_OF_SPEECH),
+        ev(0.45, COMMIT, "Hello."),
+    ]
+    script = [
+        *(first if after_a_final else []),
+        ev(0.60, T.START_OF_SPEECH),
+        ev(0.65, T.INTERIM_TRANSCRIPT, "I'd like to speak to", 0.95),
+        ev(1.00, T.FINAL_TRANSCRIPT, said),
+        ev(1.00, T.END_OF_SPEECH),
+    ]
+    api = FakeAPI(answers={"I'd like to speak to": "i'd like to speak to \u738b please"}, v=3)
+    out, ends = await run_in(language, script, api)
+    assert [text for typ, text in out if typ == T.PREFLIGHT_TRANSCRIPT] == [said]
+    assert ends[-1]["guess"] == "kept"
 
 
 @pytest.mark.parametrize("gap", [" ", ""], ids=["spaced", "unspaced"])

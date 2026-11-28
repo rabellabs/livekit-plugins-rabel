@@ -32,8 +32,10 @@ Those rules are English. For any other language the guess is written from what t
 `written`): each added word as the speech-to-text last wrote it in this call, and the turn closed the way this call's
 final transcripts have closed after the same opening word, or the way most of them have closed. Nothing about the
 language is assumed. Until the call has had a final transcript there is nothing to copy, and the guess is written as
-above, except that added words of a script written without spaces (kana, ideographs, Thai) are joined without them and
-the turn is not closed with ".": after kana or an ideograph with "。", else with no mark.
+above, except that added words of a script written without spaces (kana, ideographs, Thai), after shown text that ends
+in such a script or after none, are joined without them and the turn is not closed with ".": after kana or an ideograph
+with "。", else with no mark. Such words in a sentence of a spaced script (a name in English) are written by the English
+rules, as before.
 """
 
 from __future__ import annotations
@@ -111,7 +113,7 @@ def final_form(shown: str, added: tuple[str, ...]) -> str:
     shown = shown.strip()
     if not added:
         return shown
-    if unspaced(added):
+    if unspaced(shown, added):
         # a script written without spaces (kana, ideographs, Thai): no English rule applies, the added words are joined
         # without spaces, and the turn closed with the ideographic full stop after kana or an ideograph, else with no
         # mark (Thai writes none)
@@ -236,9 +238,14 @@ def _unspaced(c: str) -> bool:
     return not c.isspace() and len(split_words(c + c, split_character=True)) == 2
 
 
-def unspaced(words: tuple[str, ...]) -> bool:
-    """Bell's added words are of a script written without spaces (an English word never is)."""
-    return any(_unspaced(c) for w in words for c in w)
+def unspaced(shown: str, added: tuple[str, ...]) -> bool:
+    """Bell's added words are all of a script written without spaces (an English word never is), and so is the end of
+    the shown text they join, if there is one. A name of such a script in a sentence of a spaced one ("I'd like to speak
+    to" and "王", "please") is not."""
+    end = next((c for c in reversed(shown) if not _is_mark(c)), "")
+    return (
+        bool(added) and all(_unspaced(c) for w in added for c in w) and (not end or _unspaced(end))
+    )
 
 
 def _ideographic(c: str) -> bool:
